@@ -41,7 +41,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.917")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.0")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
