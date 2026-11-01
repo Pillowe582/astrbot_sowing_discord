@@ -6,14 +6,14 @@
 ![Python Version](https://img.shields.io/badge/Python-3.10.14%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)](CONTRIBUTING.md)
-[![Contributors](https://img.shields.io/github/contributors/anka-afk/astrbot_plugin_meme_manager?color=green)](https://github.com/anka-afk/astrbot_plugin_meme_manager/graphs/contributors)
-[![Last Commit](https://img.shields.io/github/last-commit/anka-afk/astrbot_plugin_meme_manager)](https://github.com/anka-afk/astrbot_plugin_meme_manager/commits/main)
+[![Contributors](https://img.shields.io/github/contributors/Pillowe582/astrbot_sowing_discord?color=green)](https://github.com/Pillowe582/astrbot_sowing_discord/graphs/contributors)
+[![Last Commit](https://img.shields.io/github/last-commit/Pillowe582/astrbot_sowing_discord)](https://github.com/Pillowe582/astrbot_sowing_discord/commits/main)
 
 </div>
 
 <div align="center">
 
-[![Moe Counter](https://count.getloli.com/get/@GalChat?theme=moebooru)](https://github.com/anka-afk/astrbot_sowing_discord)
+[![Moe Counter](https://count.getloli.com/get/@GalChat?theme=moebooru)](https://github.com/Pillowe582/astrbot_sowing_discord)
 
 </div>
 
