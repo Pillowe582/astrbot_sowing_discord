@@ -42,7 +42,35 @@
   "tag_dedupe_seconds": {
     "type": "int",
     "default": 3600,
-    "description": "同一条史的去重时间窗口 (秒)"
+    "description": "同一条史(消息 ID / 内容指纹)的去重时间窗口 (秒)"
+  },
+  "tag_content_dedupe": {
+    "type": "bool",
+    "default": true,
+    "description": "是否开启媒体内容哈希去重",
+    "hint": "开启后会下载图片字节算 SHA-256, 同一张图换消息 ID/套转发卡片再出现时也会跳过; 下载失败或无媒体时自动退回消息指纹去重"
+  },
+  "tag_content_dedupe_seconds": {
+    "type": "int",
+    "default": 3600,
+    "description": "内容哈希去重时间窗口 (秒)"
+  },
+  "tag_content_dedupe_max_bytes": {
+    "type": "int",
+    "default": 8388608,
+    "description": "单个媒体文件参与哈希的最大字节数",
+    "hint": "超过该大小的文件不做内容哈希, 仅按消息指纹去重"
+  },
+  "tag_content_dedupe_timeout_seconds": {
+    "type": "int",
+    "default": 10,
+    "description": "单个媒体文件下载的超时时间 (秒)"
+  },
+  "tag_content_dedupe_video": {
+    "type": "bool",
+    "default": false,
+    "description": "是否对视频也计算内容哈希",
+    "hint": "视频通常较大, 默认关闭, 仅按消息指纹去重"
   },
   "tag_cooldown_seconds": {
     "type": "int",

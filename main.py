@@ -10,8 +10,15 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .core.forward_manager import ForwardManager, forward_single_msg
 from .core.evaluation.evaluator import Evaluator
 from .core.evaluation.rules import GoodEmojiRule
-from .core.tag_trigger import MsgMeta, TagTrigger, classify_message, is_tag_text
+from .core.tag_trigger import (
+    MsgMeta,
+    TagTrigger,
+    classify_message,
+    is_tag_text,
+    message_fingerprint,
+)
 from .core.tag_history import fetch_recent_messages
+from .core.media_hash import compute_media_content_id
 from .storage.local_cache import LocalCache
 from .config import TEMP_DIR
 import asyncio
@@ -41,7 +48,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.1")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.2")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -78,6 +85,19 @@ class Sowing_Discord(Star):
         self.tag_dedupe_seconds = _cfg_float(config, "tag_dedupe_seconds", 3600)
         self.tag_cooldown_seconds = _cfg_float(config, "tag_cooldown_seconds", 0)
 
+        # 重复史检测: 消息指纹(免网络) + 媒体内容哈希(下载字节, 默认只算图片)
+        self.tag_content_dedupe = _cfg_bool(config, "tag_content_dedupe", True)
+        self.tag_content_dedupe_seconds = _cfg_float(
+            config, "tag_content_dedupe_seconds", 3600
+        )
+        self.tag_content_dedupe_max_bytes = _cfg_int(
+            config, "tag_content_dedupe_max_bytes", 8 * 1024 * 1024
+        )
+        self.tag_content_dedupe_timeout = _cfg_float(
+            config, "tag_content_dedupe_timeout_seconds", 10
+        )
+        self.tag_content_dedupe_video = _cfg_bool(config, "tag_content_dedupe_video", False)
+
         self.tag_state_file = os.path.join(TEMP_DIR, "tag_state.json")
         self.tagger = TagTrigger(
             prefix=self.tag_prefix,
@@ -85,6 +105,7 @@ class Sowing_Discord(Star):
             pending_seconds=self.tag_pending_seconds,
             dedupe_seconds=self.tag_dedupe_seconds,
             forward_on_pending=self.tag_forward_on_pending,
+            content_dedupe_seconds=self.tag_content_dedupe_seconds,
         )
         self._tag_lock = asyncio.Lock()
         self._last_tag_send_ts = 0.0
@@ -192,6 +213,7 @@ class Sowing_Discord(Star):
                 pending_seconds=self.tag_pending_seconds,
                 dedupe_seconds=self.tag_dedupe_seconds,
                 forward_on_pending=self.tag_forward_on_pending,
+                content_dedupe_seconds=self.tag_content_dedupe_seconds,
             )
             logger.info(
                 f"[SowingDiscord][ID:{self.instance_id}] 已加载 tag 状态: {self.tag_state_file}"
@@ -276,6 +298,7 @@ class Sowing_Discord(Star):
             ts=self._extract_platform_ts(obj),
             kind=kind,
             text=text.strip(),
+            fingerprint=message_fingerprint(message, text),
         )
 
     async def _handle_tag_message(self, event: AstrMessageEvent, meta: MsgMeta):
@@ -316,16 +339,46 @@ class Sowing_Discord(Star):
                 )
             return
 
+        if action.kind == "duplicate":
+            logger.info(
+                f"[SowingDiscord][ID:{self.instance_id}] 检测到重复史（消息指纹与最近 {self.tag_dedupe_seconds:g} 秒内已搬运过的史相同），跳过转发 (消息 ID: {action.message_id}, 触发 tag: {action.trigger_tag_id})。"
+            )
+            return
+
         if action.media_kind not in self.allowed_msg_types:
             logger.info(
                 f"[SowingDiscord][ID:{self.instance_id}] tag 命中的消息类型 {action.media_kind} 不在 allowed_message_types 中，跳过转发 (消息 ID: {action.message_id})。"
             )
             return
 
+        content_id = None
+        if self.tag_content_dedupe:
+            content_id = await compute_media_content_id(
+                event.bot,
+                action.message_id,
+                max_bytes=self.tag_content_dedupe_max_bytes,
+                timeout=self.tag_content_dedupe_timeout,
+                allow_video=self.tag_content_dedupe_video,
+            )
+            if content_id:
+                if self.tagger.content_duplicate(content_id):
+                    logger.info(
+                        f"[SowingDiscord][ID:{self.instance_id}] 检测到重复史（内容哈希 {content_id[:12]}… 与最近 {self.tag_content_dedupe_seconds:g} 秒内已搬运的一致），跳过转发 (消息 ID: {action.message_id})。"
+                    )
+                    self._save_tag_state()
+                    return
+            else:
+                logger.debug(
+                    f"[SowingDiscord][ID:{self.instance_id}] 内容哈希不可用（无媒体/下载失败/超过大小限制），本次仅按消息指纹去重 (消息 ID: {action.message_id})。"
+                )
+
         logger.info(
             f"[SowingDiscord][ID:{self.instance_id}] tag 命中：转发消息 (ID: {action.message_id}, 类型: {action.media_kind})，触发 tag: {action.trigger_tag_id}。"
         )
-        await self._send_tag_forward(event, action)
+        forwarded = await self._send_tag_forward(event, action)
+        if content_id and forwarded:
+            self.tagger.mark_content_forwarded(content_id)
+            self._save_tag_state()
 
     def _explain_tag_miss(self, meta: MsgMeta, prev_last) -> str:
         """给「tag 没命中」生成人话原因，方便线上排查。"""
@@ -353,15 +406,16 @@ class Sowing_Discord(Star):
             self.banshi_target_list = groups
         return list(groups)
 
-    async def _send_tag_forward(self, event: AstrMessageEvent, action):
-        """把命中的史转发到所有目标群(串行, 队列化)。"""
+    async def _send_tag_forward(self, event: AstrMessageEvent, action) -> bool:
+        """把命中的史转发到所有目标群(串行, 队列化); 至少成功一个目标群返回 True。"""
         targets = await self._resolve_targets(event)
         if not targets:
             logger.warning(
                 f"[SowingDiscord][ID:{self.instance_id}] 没有可用的目标群，跳过转发 (消息 ID: {action.message_id})。"
             )
-            return
+            return False
 
+        sent_any = False
         async with self.forward_lock:
             if self.tag_cooldown_seconds > 0 and self._last_tag_send_ts > 0:
                 wait_seconds = self.tag_cooldown_seconds - (
@@ -373,6 +427,7 @@ class Sowing_Discord(Star):
             for target_id in targets:
                 try:
                     await forward_single_msg(event.bot, action.message_id, target_id)
+                    sent_any = True
                     logger.info(
                         f"[SowingDiscord][ID:{self.instance_id}] 成功转发消息 (ID: {action.message_id}) 到目标群: {target_id}。"
                     )
@@ -392,6 +447,7 @@ class Sowing_Discord(Star):
                     f"[SowingDiscord][ID:{self.instance_id}] tag 冷却开始：时长 {self.tag_cooldown_seconds} 秒 (持有锁)。"
                 )
                 await asyncio.sleep(self.tag_cooldown_seconds)
+        return sent_any
 
     # ------------------------------------------------------------------ #
     # 事件入口

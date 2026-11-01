@@ -61,11 +61,20 @@ https://sowingdiscord.ankaanka.org
      - `tag 未命中：...` —— 会直接写出原因(上一条不是媒体 / 间隔超出 / 已转发过去重 / 没有上一条记录)
    - 常见原因: 史和 tag 间隔超过 30 秒; 中间夹了文字评论; 发送者不是同一人; 来源群不在 `banshi_group_list`; bot 重启后历史回填失败(接口不支持时该 tag 会被跳过)
 
+3. **Q: 同一张史被搬来搬去, 怎么避免重复搬运?**
+
+   - A: 插件默认开启两层重复检测:
+     - **消息指纹**: 对消息里的文件 id / 转发记录 id / 规范化 URL / 文本做哈希, 同一条消息换了个消息 ID 再出现也能认出来, 不需要网络;
+     - **内容哈希**: 下载史里的图片字节算 SHA-256(转发卡片会拆开取里面的图片), 因此同一张图被重新上传、或套了一层转发卡片再出现时, 内容 ID 依然相同。
+   - 命中重复时日志会打印 `检测到重复史（消息指纹...` 或 `检测到重复史（内容哈希 ...`, 并跳过转发。
+   - 局限: 视频默认不算内容哈希(太大), 只按消息指纹去重; 单文件超过 `tag_content_dedupe_max_bytes`(默认 8MB)或下载失败时自动退回消息指纹; 去重窗口由 `tag_content_dedupe_seconds` 控制(默认 3600 秒)。
+
 ## ✨ 功能
 
 - 🚫 自动从指定的群聊(推荐加入 1032915502, 共建搬史中心), 转发聊天记录(史)到其他指定的群聊(详见设置)
 - 🏷️ 支持 `#tag` 触发: 由群友主动指定要搬的史, 命中即转发, 无需等待
 - 🔁 同一发送者的严格相邻匹配: 史和 tag 之间只有文字评论时不转发
+- ♻️ 重复史检测: 消息指纹(免网络) + 媒体内容哈希(下载图片字节算 SHA-256), 最近搬过的同一张图/同一条史再次出现时自动跳过转发
 - 🧠 重启兜底: 状态持久化到 `sowing_discord_cache/tag_state.json`, 必要时调用 OneBot 历史接口回填
 
 ## 🛠️ 使用方法
@@ -86,7 +95,12 @@ https://sowingdiscord.ankaanka.org
 - `tag_forward_on_pending`: 是否允许「tag 先到、史后到」也转发, 默认 true
 - `tag_history_fallback`: bot 重启后是否调用 `get_group_msg_history` 回填历史, 默认 true
 - `tag_history_count`: 历史回填拉取的最大消息条数, 默认 50
-- `tag_dedupe_seconds`: 同一条史的去重时间窗口(秒), 默认 3600
+- `tag_dedupe_seconds`: 同一条史(消息 ID / 内容指纹)的去重时间窗口(秒), 默认 3600
+- `tag_content_dedupe`: 是否开启媒体内容哈希去重, 默认 true
+- `tag_content_dedupe_seconds`: 内容哈希去重时间窗口(秒), 默认 3600
+- `tag_content_dedupe_max_bytes`: 单个媒体文件参与内容哈希的最大字节数, 默认 8388608 (8MB)
+- `tag_content_dedupe_timeout_seconds`: 单个媒体文件下载超时(秒), 默认 10
+- `tag_content_dedupe_video`: 是否对视频也计算内容哈希, 默认 false
 - `tag_cooldown_seconds`: 两次转发之间的最小间隔(秒), 0 表示不限制
 
 ### 通用
