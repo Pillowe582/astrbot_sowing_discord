@@ -45,24 +45,50 @@ https://sowingdiscord.ankaanka.org
 
 1. **Q: 为什么我的 bot 没有自动搬史?**
 
-   - A: 插件逻辑如下:
-     - 1. 插件会从指定的群聊(搬史源头)中获取消息, 并缓存消息
-     - 2. 10 分钟后, 插件会获取消息的贴表情信息, 如果满足评价条件(好史), 就会触发搬史
-     - 3. 因此你至少需要等待 10 分钟, 插件才会开始搬史
+   - A: 当前默认使用 **tag 触发模式**, 插件逻辑如下:
+     - 1. 插件监听 `banshi_group_list` 中来源群的所有消息
+     - 2. 当有人发送以 `#` 开头的 tag 消息时, 插件会找**同一个发送者**、**严格相邻**的上一条消息
+     - 3. 如果上一条是图片 / 视频 / 聊天记录, 且与 tag 间隔在 30 秒以内, 就转发这条史
+     - 4. 如果 tag 先发、史后发: 插件会等同一人 60 秒内的下一条消息, 是媒体才转发, 是文字则取消等待
+     - 5. bot 重启后如果内存里没有状态, 会调用 `get_group_msg_history` 向上回填历史; 回填失败则跳过该 tag, 不会乱转
+   - 如需恢复旧版「贴表情评估」触发方式, 把 `trigger_mode` 改为 `emoji` 即可 (旧版需要等待约 10 分钟)
 
 ## ✨ 功能
 
 - 🚫 自动从指定的群聊(推荐加入 1032915502, 共建搬史中心), 转发聊天记录(史)到其他指定的群聊(详见设置)
+- 🏷️ 支持 `#tag` 触发: 由群友主动指定要搬的史, 命中即转发, 无需等待
+- 🔁 同一发送者的严格相邻匹配: 史和 tag 之间只有文字评论时不转发
+- 🧠 重启兜底: 状态持久化到 `sowing_discord_cache/tag_state.json`, 必要时调用 OneBot 历史接口回填
 
 ## 🛠️ 使用方法
 
 1. 加入天天发史的群聊
 2. 设置该群聊为搬史源头, 设置目标群聊
-3. bot 开始全自动搬史!
+3. 在来源群里发一条史(图片/视频/聊天记录), 然后 30 秒内发一条 `#任意内容` 的 tag
+4. bot 就会把那条史转到目标群!
 
 ## ⚙️ 配置说明
 
-插件配置项包括：
+### tag 触发模式 (默认)
+
+- `trigger_mode`: 触发方式, `tag`(默认) 或 `emoji`(旧版)
+- `tag_prefix`: tag 触发前缀, 默认 `#`
+- `tag_match_window_seconds`: 史与 tag 的最大时间间隔(秒), 默认 30
+- `tag_pending_seconds`: tag 先于史时等待同一人发史的时间(秒), 默认 60
+- `tag_forward_on_pending`: 是否允许「tag 先到、史后到」也转发, 默认 true
+- `tag_history_fallback`: bot 重启后是否调用 `get_group_msg_history` 回填历史, 默认 true
+- `tag_history_count`: 历史回填拉取的最大消息条数, 默认 50
+- `tag_dedupe_seconds`: 同一条史的去重时间窗口(秒), 默认 3600
+- `tag_cooldown_seconds`: 两次转发之间的最小间隔(秒), 0 表示不限制
+
+### 通用
+
+- `banshi_group_list`: 史的来源群列表
+- `banshi_target_list`: 白名单, 史的目标列表, 可以填写多个群或用户, 默认空白即全部群
+- `block_source_messages`: 开启后将屏蔽 banshi_group_list 中的群消息
+- `allowed_message_types`: 允许转发的消息类型 (`text` / `image` / `video` / `forward`)
+
+### 旧版 emoji 模式
 
 - `banshi_interval`: 搬史间隔, 单位: 秒（兼容项，实际冷却由时间段动态决定）
 - `banshi_cache_seconds`: 消息缓存时间限制, 也是转发前检查历史消息的时间窗口 (秒)
@@ -70,9 +96,6 @@ https://sowingdiscord.ankaanka.org
 - `banshi_cooldown_night_seconds`: 动态冷却-夜间冷却秒数（默认 3600）
 - `banshi_cooldown_day_start`: 动态冷却-白天时段起始时间（HH:MM，默认 09:00）
 - `banshi_cooldown_night_start`: 动态冷却-夜间时段起始时间（HH:MM，默认 01:00）
-- `banshi_group_list`: 史的来源群列表
-- `banshi_target_list`: 白名单, 史的目标列表, 可以填写多个群或用户, 默认空白即全部群
-- `block_source_messages`: 开启后将屏蔽 banshi_group_list 中的群消息
 
 ## 👥 贡献指南
 

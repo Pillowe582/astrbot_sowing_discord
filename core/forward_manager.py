@@ -3,6 +3,18 @@ from astrbot.api.event import AstrMessageEvent
 from typing import List, Dict, Union
 
 
+async def forward_single_msg(bot, message_id: int, group_id: int) -> None:
+    """把单条消息以「合并转发卡片」的形式转发到目标群(OneBot API)。
+
+    Args:
+        bot: AstrBot 消息事件里的 bot(aiocqhttp CQHttp 实例)
+        message_id (int): 要转发的源消息 ID
+        group_id (int): 目标群号
+    """
+    payloads = {"group_id": group_id, "message_id": message_id}
+    await bot.api.call_action("forward_group_single_msg", **payloads)
+
+
 class ForwardManager:
     def __init__(self, event: AstrMessageEvent):
         self.event = event

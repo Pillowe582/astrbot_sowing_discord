@@ -1,33 +1,83 @@
 {
+  "trigger_mode": {
+    "type": "string",
+    "default": "tag",
+    "options": ["tag", "emoji"],
+    "description": "触发方式",
+    "hint": "tag: 订阅者发送以 # 开头的 tag 消息时，转发同一人严格相邻的图片/视频/聊天记录; emoji: 旧版表情评估触发"
+  },
+  "tag_prefix": {
+    "type": "string",
+    "default": "#",
+    "description": "tag 触发前缀"
+  },
+  "tag_match_window_seconds": {
+    "type": "int",
+    "default": 30,
+    "description": "史与 tag 的最大时间间隔 (秒)",
+    "hint": "史在 tag 之前, 且两者间隔不超过该值时才会转发"
+  },
+  "tag_pending_seconds": {
+    "type": "int",
+    "default": 60,
+    "description": "tag 先于史时, 等待同一人发史的时间 (秒)",
+    "hint": "等待期间同一人的下一条消息必须是媒体, 否则取消等待"
+  },
+  "tag_forward_on_pending": {
+    "type": "bool",
+    "default": true,
+    "description": "是否允许「tag 先到、史后到」也触发转发"
+  },
+  "tag_history_fallback": {
+    "type": "bool",
+    "default": true,
+    "description": "bot 重启后是否调用 get_group_msg_history 向上回填历史",
+    "hint": "回填失败(接口不支持/无权限)时会跳过该 tag, 不会乱转"
+  },
+  "tag_history_count": {
+    "type": "int",
+    "default": 50,
+    "description": "历史回填时拉取的最大消息条数"
+  },
+  "tag_dedupe_seconds": {
+    "type": "int",
+    "default": 3600,
+    "description": "同一条史的去重时间窗口 (秒)"
+  },
+  "tag_cooldown_seconds": {
+    "type": "int",
+    "default": 0,
+    "description": "tag 模式两次转发之间的最小间隔 (秒), 0 表示不限制"
+  },
   "banshi_interval": {
     "type": "int",
     "default": 30,
-    "description": "搬史间隔, 单位: 秒"
+    "description": "(旧版) 搬史间隔, 单位: 秒"
   },
   "banshi_cache_seconds": {
     "type": "int",
     "default": 3600,
-    "description": "消息缓存时间限制, 也是转发前检查历史消息的时间窗口 (秒)"
+    "description": "(旧版 emoji 模式) 消息缓存时间限制, 也是转发前检查历史消息的时间窗口 (秒)"
   },
   "banshi_cooldown_day_seconds": {
     "type": "int",
     "default": 600,
-    "description": "动态冷却：白天(09:00-01:00) 冷却秒数"
+    "description": "(旧版 emoji 模式) 动态冷却：白天(09:00-01:00) 冷却秒数"
   },
   "banshi_cooldown_night_seconds": {
     "type": "int",
     "default": 3600,
-    "description": "动态冷却：夜间(01:00-09:00) 冷却秒数"
+    "description": "(旧版 emoji 模式) 动态冷却：夜间(01:00-09:00) 冷却秒数"
   },
   "banshi_cooldown_day_start": {
     "type": "string",
     "default": "09:00",
-    "description": "动态冷却：白天时段起始时间 (HH:MM)"
+    "description": "(旧版 emoji 模式) 动态冷却：白天时段起始时间 (HH:MM)"
   },
   "banshi_cooldown_night_start": {
     "type": "string",
     "default": "01:00",
-    "description": "动态冷却：夜间时段起始时间 (HH:MM)"
+    "description": "(旧版 emoji 模式) 动态冷却：夜间时段起始时间 (HH:MM)"
   },
   "banshi_group_list": {
     "type": "list",
