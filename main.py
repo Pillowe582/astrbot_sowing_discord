@@ -48,7 +48,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.2")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.3")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -96,7 +96,10 @@ class Sowing_Discord(Star):
         self.tag_content_dedupe_timeout = _cfg_float(
             config, "tag_content_dedupe_timeout_seconds", 10
         )
-        self.tag_content_dedupe_video = _cfg_bool(config, "tag_content_dedupe_video", False)
+        self.tag_content_dedupe_video = _cfg_bool(config, "tag_content_dedupe_video", True)
+        self.tag_content_dedupe_ffmpeg = str(
+            config.get("tag_content_dedupe_ffmpeg", "") or ""
+        ).strip()
 
         self.tag_state_file = os.path.join(TEMP_DIR, "tag_state.json")
         self.tagger = TagTrigger(
@@ -359,6 +362,7 @@ class Sowing_Discord(Star):
                 max_bytes=self.tag_content_dedupe_max_bytes,
                 timeout=self.tag_content_dedupe_timeout,
                 allow_video=self.tag_content_dedupe_video,
+                ffmpeg_path=self.tag_content_dedupe_ffmpeg,
             )
             if content_id:
                 if self.tagger.content_duplicate(content_id):

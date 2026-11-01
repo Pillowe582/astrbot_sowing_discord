@@ -160,3 +160,122 @@ def test_compute_content_id_returns_none_without_media():
 def test_compute_content_id_tolerates_api_errors():
     bot = FakeBot({"get_msg": RuntimeError("boom")})
     assert asyncio.run(media_hash.compute_media_content_id(bot, 1)) is None
+
+
+# --------------------------------------------------------------------------- #
+# 视频: 按第一帧去重(ffmpeg 首帧优先, 文件头兜底)
+# --------------------------------------------------------------------------- #
+def test_walk_forward_media_can_include_video():
+    payload = {
+        "messages": [
+            {
+                "type": "node",
+                "data": {
+                    "content": [
+                        {"type": "image", "data": {"url": "http://x/1"}},
+                        {"type": "video", "data": {"url": "http://x/v"}},
+                    ]
+                },
+            }
+        ]
+    }
+    assert media_hash._walk_forward_media(payload) == [("image", "http://x/1")]
+    assert media_hash._walk_forward_media(payload, allow_video=True) == [
+        ("image", "http://x/1"),
+        ("video", "http://x/v"),
+    ]
+
+
+def test_find_ffmpeg_hint_and_auto(monkeypatch, tmp_path):
+    fake = tmp_path / "ffmpeg.exe"
+    fake.write_bytes(b"")
+    assert media_hash._find_ffmpeg(str(fake)) == str(fake)
+    assert media_hash._find_ffmpeg("definitely-not-a-real-ffmpeg-xyz") is None
+
+    monkeypatch.setattr(media_hash.shutil, "which", lambda name: "/fake/ffmpeg")
+    monkeypatch.setattr(media_hash, "_FFMPEG_PROBE", None)
+    assert media_hash._find_ffmpeg() == "/fake/ffmpeg"
+
+
+def test_video_hash_prefers_first_frame(monkeypatch):
+    async def fake_frame(url, timeout, ffmpeg):
+        assert url == "http://x/v"
+        assert ffmpeg == "/fake/ffmpeg"
+        return "framehash"
+
+    monkeypatch.setattr(media_hash, "_find_ffmpeg", lambda hint="": "/fake/ffmpeg")
+    monkeypatch.setattr(media_hash, "_extract_video_first_frame_sha256", fake_frame)
+    assert (
+        asyncio.run(media_hash._video_hash("http://x/v", timeout=1.0))
+        == "vf:framehash"
+    )
+
+
+def test_video_hash_falls_back_to_prefix_when_no_ffmpeg(monkeypatch):
+    monkeypatch.setattr(media_hash, "_find_ffmpeg", lambda hint="": None)
+    monkeypatch.setattr(
+        media_hash, "_download_prefix_sha256", lambda url, n, timeout: "abc"
+    )
+    assert asyncio.run(media_hash._video_hash("http://x/v", timeout=1.0)) == "vp:abc"
+
+
+def test_video_hash_falls_back_when_frame_decode_fails(monkeypatch):
+    async def broken_frame(url, timeout, ffmpeg):
+        return None
+
+    monkeypatch.setattr(media_hash, "_find_ffmpeg", lambda hint="": "/fake/ffmpeg")
+    monkeypatch.setattr(media_hash, "_extract_video_first_frame_sha256", broken_frame)
+    monkeypatch.setattr(
+        media_hash, "_download_prefix_sha256", lambda url, n, timeout: "abc"
+    )
+    assert asyncio.run(media_hash._video_hash("http://x/v", timeout=1.0)) == "vp:abc"
+
+
+def test_video_hash_returns_none_when_everything_fails(monkeypatch):
+    async def broken_frame(url, timeout, ffmpeg):
+        return None
+
+    def broken_prefix(url, n, timeout):
+        raise OSError("boom")
+
+    monkeypatch.setattr(media_hash, "_find_ffmpeg", lambda hint="": "/fake/ffmpeg")
+    monkeypatch.setattr(media_hash, "_extract_video_first_frame_sha256", broken_frame)
+    monkeypatch.setattr(media_hash, "_download_prefix_sha256", broken_prefix)
+    assert asyncio.run(media_hash._video_hash("http://x/v", timeout=1.0)) is None
+
+
+def test_compute_content_id_video_with_allow_video(monkeypatch):
+    async def fake_video_hash(url, *, timeout, ffmpeg_path=""):
+        return "vf:framehash"
+
+    monkeypatch.setattr(media_hash, "_video_hash", fake_video_hash)
+    bot = FakeBot(
+        {
+            "get_msg": {
+                "message": [
+                    {"type": "video", "data": {"url": "http://127.0.0.1:1/v"}},
+                ]
+            }
+        }
+    )
+    content_id = asyncio.run(
+        media_hash.compute_media_content_id(bot, 9, allow_video=True)
+    )
+    assert content_id == media_hash.combine_hashes(["vf:framehash"])
+
+
+def test_compute_content_id_skips_video_by_default(monkeypatch):
+    async def fake_video_hash(url, *, timeout, ffmpeg_path=""):
+        raise AssertionError("video should not be hashed when allow_video=False")
+
+    monkeypatch.setattr(media_hash, "_video_hash", fake_video_hash)
+    bot = FakeBot(
+        {
+            "get_msg": {
+                "message": [
+                    {"type": "video", "data": {"url": "http://127.0.0.1:1/v"}},
+                ]
+            }
+        }
+    )
+    assert asyncio.run(media_hash.compute_media_content_id(bot, 9)) is None

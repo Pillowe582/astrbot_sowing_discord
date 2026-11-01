@@ -68,9 +68,15 @@
   },
   "tag_content_dedupe_video": {
     "type": "bool",
-    "default": false,
-    "description": "是否对视频也计算内容哈希",
-    "hint": "视频通常较大, 默认关闭, 仅按消息指纹去重"
+    "default": true,
+    "description": "是否对视频按首帧去重",
+    "hint": "开启后用 ffmpeg 解码视频第一帧再哈希, 不需要下载整个视频; 找不到 ffmpeg 时退回视频开头 256KB 字节哈希"
+  },
+  "tag_content_dedupe_ffmpeg": {
+    "type": "string",
+    "default": "",
+    "description": "ffmpeg 可执行文件路径 (可选)",
+    "hint": "留空自动在 PATH 中查找; 视频首帧去重依赖 ffmpeg, 没有时自动退回文件头哈希"
   },
   "tag_cooldown_seconds": {
     "type": "int",
