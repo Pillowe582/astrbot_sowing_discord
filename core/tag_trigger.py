@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 MEDIA_KINDS = ("image", "video", "forward")
@@ -27,6 +27,16 @@ OTHER_KIND = "other"
 
 _CQ_PATTERN = re.compile(r"\[CQ:.*?\]", re.S)
 _MAX_FORWARDED_ENTRIES = 5000
+_MAX_RECENT_MESSAGES = 10
+
+# 部分适配器把媒体消息的 message_str 记成占位文本(组件列表为空)时的兜底
+_PLACEHOLDER_KINDS = {
+    "[图片]": "image",
+    "[视频]": "video",
+    "[聊天记录]": "forward",
+    "[合并转发]": "forward",
+    "[转发消息]": "forward",
+}
 
 
 def is_tag_text(text: str, prefix: str = "#") -> bool:
@@ -56,7 +66,10 @@ def classify_message(message, text: str = "") -> str:
             return "video"
         if "[CQ:forward" in message or "[CQ:node" in message:
             return "forward"
-        return TEXT_KIND if _CQ_PATTERN.sub("", message).strip() else OTHER_KIND
+        remaining = _CQ_PATTERN.sub("", message).strip()
+        if remaining in _PLACEHOLDER_KINDS:
+            return _PLACEHOLDER_KINDS[remaining]
+        return TEXT_KIND if remaining else OTHER_KIND
 
     if isinstance(message, (list, tuple)):
         media: Optional[str] = None
@@ -86,9 +99,17 @@ def classify_message(message, text: str = "") -> str:
                         has_text = True
         if media:
             return media
-        return TEXT_KIND if has_text else OTHER_KIND
+        if has_text:
+            stripped = str(text or "").strip()
+            if stripped in _PLACEHOLDER_KINDS:
+                return _PLACEHOLDER_KINDS[stripped]
+            return TEXT_KIND
+        return OTHER_KIND
 
-    return TEXT_KIND if (text and text.strip()) else OTHER_KIND
+    stripped = str(text or "").strip()
+    if stripped in _PLACEHOLDER_KINDS:
+        return _PLACEHOLDER_KINDS[stripped]
+    return TEXT_KIND if stripped else OTHER_KIND
 
 
 @dataclass
@@ -141,6 +162,8 @@ class Action:
 class _SenderState:
     last: Optional[MsgMeta] = None
     pending_tag: Optional[MsgMeta] = None
+    # 该发送者最近处理的若干条消息(按处理顺序), 用于处理「事件到达顺序与平台时间不一致」
+    recent: List[MsgMeta] = field(default_factory=list)
 
 
 class TagTrigger:
@@ -183,18 +206,20 @@ class TagTrigger:
         if state is None:
             state = self._states[key] = _SenderState()
 
-        best: Optional[MsgMeta] = None
+        candidates: List[MsgMeta] = []
         for item in history:
             if item.group_id != tag.group_id or item.sender_id != tag.sender_id:
                 continue
-            if item.message_id == tag.message_id:
+            if item.message_id == tag.message_id or item.ts > tag.ts:
                 continue
-            if item.ts > tag.ts:
-                continue
-            if best is None or (item.ts, item.message_id) > (best.ts, best.message_id):
-                best = item
-        if best is not None:
-            state.last = best
+            candidates.append(item)
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: (item.ts, item.message_id))
+        for item in candidates[-_MAX_RECENT_MESSAGES:]:
+            state.recent.append(item)
+        state.last = candidates[-1]
 
     def observe(self, meta: MsgMeta) -> Optional[Action]:
         """处理一条消息, 返回需要转发的 Action(没有则返回 None)。"""
@@ -203,6 +228,10 @@ class TagTrigger:
         state = self._states.get(key)
         if state is None:
             state = self._states[key] = _SenderState()
+
+        state.recent.append(meta)
+        if len(state.recent) > _MAX_RECENT_MESSAGES:
+            del state.recent[: -_MAX_RECENT_MESSAGES]
 
         action: Optional[Action] = None
 
@@ -215,22 +244,21 @@ class TagTrigger:
             elif not self._is_replayed_tag(state.last, meta):
                 # 未命中且不是重复 tag -> 进入 pending, 等待同人的下一条消息
                 state.pending_tag = meta
-            state.last = meta
         else:
             pending = state.pending_tag
             if pending is not None:
-                # 严格相邻: 只匹配 pending tag 之后该发送者的下一条消息
-                if (
-                    state.last is not None
-                    and state.last.message_id == pending.message_id
-                    and meta.is_media
-                    and self.forward_on_pending
-                    and 0 <= meta.ts - pending.ts <= self.pending_seconds
-                    and self._forwardable(meta)
-                ):
+                if self._can_match_pending(state, meta, pending):
+                    # 正常顺序: 该发送者 pending 之后的下一条消息就是媒体
+                    action = Action("forward", meta.message_id, meta.kind, pending.message_id)
+                    self._mark_forwarded(meta, meta.ts)
+                elif self._can_match_late_media(state, meta, pending):
+                    # 乱序: 史实际先发出, 但事件比 tag 晚到, 按平台时间判断仍是紧邻的史
                     action = Action("forward", meta.message_id, meta.kind, pending.message_id)
                     self._mark_forwarded(meta, meta.ts)
                 state.pending_tag = None
+
+        # 只有平台时间更新(或不更旧)的消息才覆盖 last, 避免迟到事件把状态往回拨
+        if state.last is None or meta.ts >= state.last.ts:
             state.last = meta
 
         return action
@@ -238,6 +266,19 @@ class TagTrigger:
     def expire(self, now: Optional[float] = None) -> None:
         """清理过期的 pending 与去重记录(由 observe 自动调用, 也可手动调用)。"""
         self._prune(_now() if now is None else float(now))
+
+    def last_for(self, meta: MsgMeta) -> Optional[MsgMeta]:
+        """该发送者最近一条消息(用于日志/诊断, 需在 observe 之前调用)。"""
+        state = self._states.get((meta.group_id, meta.sender_id))
+        return state.last if state else None
+
+    def is_forwarded(self, meta: MsgMeta) -> bool:
+        return meta.message_id in self._forwarded
+
+    def has_pending(self, meta: MsgMeta) -> bool:
+        """该发送者当前是否有等待中的 tag。"""
+        state = self._states.get((meta.group_id, meta.sender_id))
+        return bool(state is not None and state.pending_tag is not None)
 
     # ------------------------------------------------------------------ #
     # 持久化
@@ -287,6 +328,38 @@ class TagTrigger:
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
+    def _can_match_pending(
+        self, state: _SenderState, meta: MsgMeta, pending: MsgMeta
+    ) -> bool:
+        """正常顺序: tag 之后该发送者的*下一条*消息就是媒体。"""
+        if not meta.is_media or not self.forward_on_pending:
+            return False
+        if state.last is None or state.last.message_id != pending.message_id:
+            return False
+        if not (0 <= meta.ts - pending.ts <= self.pending_seconds):
+            return False
+        return self._forwardable(meta)
+
+    def _can_match_late_media(
+        self, state: _SenderState, meta: MsgMeta, pending: MsgMeta
+    ) -> bool:
+        """乱序: 史的平台时间在 tag 之前, 但事件比 tag 晚到。
+
+        仅当两者按平台时间紧邻(中间没有该发送者的其它消息)时才匹配。
+        """
+        if not meta.is_media or not self.forward_on_pending:
+            return False
+        if not (meta.ts <= pending.ts and pending.ts - meta.ts <= self.match_window_seconds):
+            return False
+        if not self._forwardable(meta):
+            return False
+        for other in state.recent:
+            if other.message_id in (meta.message_id, pending.message_id):
+                continue
+            if meta.ts < other.ts < pending.ts:
+                return False
+        return True
+
     def _can_match_tag(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
         if last is None or not last.is_media:
             return False

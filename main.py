@@ -10,7 +10,7 @@ from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .core.forward_manager import ForwardManager, forward_single_msg
 from .core.evaluation.evaluator import Evaluator
 from .core.evaluation.rules import GoodEmojiRule
-from .core.tag_trigger import MsgMeta, TagTrigger, classify_message
+from .core.tag_trigger import MsgMeta, TagTrigger, classify_message, is_tag_text
 from .core.tag_history import fetch_recent_messages
 from .storage.local_cache import LocalCache
 from .config import TEMP_DIR
@@ -41,7 +41,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.0")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.1")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -261,6 +261,11 @@ class Sowing_Discord(Star):
             return None
 
         message = getattr(obj, "message", None)
+        if not message:
+            # 少数适配器不填 message_obj.message, 退回到原始事件里的消息段
+            raw = getattr(obj, "raw_message", None)
+            if isinstance(raw, dict):
+                message = raw.get("message")
         text = str(getattr(obj, "message_str", "") or "")
         kind = classify_message(message, text)
 
@@ -276,6 +281,16 @@ class Sowing_Discord(Star):
     async def _handle_tag_message(self, event: AstrMessageEvent, meta: MsgMeta):
         """处理一条源群消息: 同步更新状态机, 命中后异步转发。"""
         async with self._tag_lock:
+            is_tag = self.tagger.is_tag(meta)
+            if is_tag:
+                logger.info(
+                    f"[SowingDiscord][ID:{self.instance_id}] 收到 tag 候选：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 内容: {meta.text!r}"
+                )
+            elif meta.is_media:
+                logger.info(
+                    f"[SowingDiscord][ID:{self.instance_id}] 观察到媒体消息：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 类型: {meta.kind}"
+                )
+
             if self.tagger.needs_history(meta) and self.tag_history_fallback:
                 history = await fetch_recent_messages(
                     event.bot, meta.group_id, self.tag_history_count
@@ -290,13 +305,14 @@ class Sowing_Discord(Star):
                     f"[SowingDiscord][ID:{self.instance_id}] 已回填 {len(history)} 条历史消息，用于判断 tag (消息 ID: {meta.message_id})。"
                 )
 
+            prev_last = self.tagger.last_for(meta)
             action = self.tagger.observe(meta)
             self._save_tag_state()
 
         if action is None:
-            if self.tagger.is_tag(meta):
-                logger.debug(
-                    f"[SowingDiscord][ID:{self.instance_id}] tag 未命中，进入等待 (消息 ID: {meta.message_id}, 发送者: {meta.sender_id})。"
+            if is_tag:
+                logger.info(
+                    f"[SowingDiscord][ID:{self.instance_id}] tag 未命中：{self._explain_tag_miss(meta, prev_last)}"
                 )
             return
 
@@ -310,6 +326,24 @@ class Sowing_Discord(Star):
             f"[SowingDiscord][ID:{self.instance_id}] tag 命中：转发消息 (ID: {action.message_id}, 类型: {action.media_kind})，触发 tag: {action.trigger_tag_id}。"
         )
         await self._send_tag_forward(event, action)
+
+    def _explain_tag_miss(self, meta: MsgMeta, prev_last) -> str:
+        """给「tag 没命中」生成人话原因，方便线上排查。"""
+        window = self.tag_match_window
+        if prev_last is None:
+            return "该发送者没有上一条消息记录（重启后首条 tag 且历史回填失败时会这样，已跳过一次）"
+        if not prev_last.is_media:
+            return (
+                f"上一条不是媒体（ID: {prev_last.message_id}, 类型: {prev_last.kind}），"
+                f"已进入等待，同人 {self.tag_pending_seconds:g} 秒内补发媒体仍会转发"
+            )
+        if self.tagger.is_forwarded(prev_last):
+            return f"上一条媒体已转发过，按重复 tag 忽略（ID: {prev_last.message_id}）"
+        delta = meta.ts - prev_last.ts
+        return (
+            f"上一条媒体与 tag 间隔 {delta:.1f}s，超出 {window:g} 秒限制，"
+            f"已进入等待，同人 {self.tag_pending_seconds:g} 秒内补发媒体仍会转发"
+        )
 
     async def _resolve_targets(self, event: AstrMessageEvent) -> list:
         if self.banshi_target_list:
@@ -374,10 +408,21 @@ class Sowing_Discord(Star):
             event.stop_event()
 
         if self.trigger_mode == "tag":
-            if is_in_source_list:
-                meta = self._extract_meta(event)
-                if meta is not None:
-                    await self._handle_tag_message(event, meta)
+            meta = self._extract_meta(event)
+            if meta is None:
+                text = str(getattr(event.message_obj, "message_str", "") or "")
+                if is_tag_text(text, self.tag_prefix):
+                    logger.info(
+                        f"[SowingDiscord][ID:{self.instance_id}] 收到 tag 内容，但该消息没有群号（私聊？）或消息 ID 非数字，无法处理，已忽略。"
+                    )
+                return None
+            if not is_in_source_list:
+                if is_tag_text(meta.text, self.tag_prefix):
+                    logger.info(
+                        f"[SowingDiscord][ID:{self.instance_id}] 收到 tag 候选，但群 {meta.group_id} 不在 banshi_group_list 来源群列表中，已忽略。"
+                    )
+                return None
+            await self._handle_tag_message(event, meta)
             return None
 
         await self._handle_emoji_message(event)

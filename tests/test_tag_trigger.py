@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """core/tag_trigger.py 的纯逻辑单元测试(不依赖 AstrBot, 无需安装框架)。
 
 运行:
@@ -290,6 +290,76 @@ def test_apply_history_ignores_other_senders_and_future_messages():
 # --------------------------------------------------------------------------- #
 # 持久化
 # --------------------------------------------------------------------------- #
+def test_classify_message_placeholders():
+    # 适配器没给组件、只给了占位文本时的兜底
+    assert classify_message([], "[图片]") == "image"
+    assert classify_message([], "[视频]") == "video"
+    assert classify_message([], "[聊天记录]") == "forward"
+    assert classify_message([], "[转发消息]") == "forward"
+    assert classify_message([], "普通文字") == "text"
+    assert classify_message("[图片]") == "image"
+    assert classify_message("") == "other"
+
+
+# --------------------------------------------------------------------------- #
+# 事件乱序(史先发出, 但事件比 tag 晚到)
+# --------------------------------------------------------------------------- #
+def test_media_processed_after_tag_still_forwards():
+    trigger = TagTrigger()
+    trigger.observe(text(1, 100.0, body="上一条是文字评论"))
+
+    assert trigger.observe(tag(2, 110.0)) is None
+    assert trigger.has_pending(tag(2, 110.0)) is True
+
+    # 史在 105s 发出, 但事件比 tag 晚到 -> 仍应命中
+    action = trigger.observe(media(3, 105.0))
+    assert action is not None
+    assert action.message_id == 3
+    assert action.trigger_tag_id == 2
+
+
+def test_late_media_with_other_message_between_is_ignored():
+    trigger = TagTrigger()
+    trigger.observe(text(1, 100.0, body="评论A"))
+    trigger.observe(text(2, 108.0, body="评论B"))
+    trigger.observe(tag(3, 110.0))
+
+    # 104s 的史与 tag 之间还夹着 108s 的评论 -> 不算相邻
+    assert trigger.observe(media(4, 104.0)) is None
+
+
+def test_late_media_outside_window_is_ignored():
+    trigger = TagTrigger()
+    trigger.observe(text(1, 100.0))
+    trigger.observe(tag(2, 200.0))
+    assert trigger.observe(media(3, 169.0)) is None  # 间隔 31s > 30s
+
+
+def test_late_media_does_not_rollback_last():
+    trigger = TagTrigger()
+    trigger.observe(text(1, 100.0))
+    trigger.observe(tag(2, 120.0))
+    assert trigger.observe(media(3, 110.0)) is not None
+
+    # 迟到事件的平台时间更旧, 不能把 last 回拨
+    last = trigger.last_for(text(4, 130.0))
+    assert last is not None and last.message_id == 2
+
+
+def test_diagnostic_helpers():
+    trigger = TagTrigger()
+    assert trigger.last_for(tag(1, 100.0)) is None
+
+    trigger.observe(media(1, 100.0))
+    last = trigger.last_for(tag(2, 105.0))
+    assert last is not None and last.message_id == 1
+    assert trigger.is_forwarded(media(1, 100.0)) is False
+    assert trigger.has_pending(tag(2, 105.0)) is False
+
+    assert trigger.observe(tag(2, 105.0)) is not None
+    assert trigger.is_forwarded(media(1, 100.0)) is True
+
+
 def test_state_roundtrip_keeps_dedupe_and_pending():
     trigger = TagTrigger()
     trigger.observe(media(1, 100.0))
