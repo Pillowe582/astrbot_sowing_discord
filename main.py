@@ -48,7 +48,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.3")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.4")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -78,6 +78,7 @@ class Sowing_Discord(Star):
         )
         self.tag_prefix = str(config.get("tag_prefix", "#") or "#")
         self.tag_match_window = _cfg_float(config, "tag_match_window_seconds", 30)
+        self.tag_clock_skew = _cfg_float(config, "tag_clock_skew_seconds", 10)
         self.tag_pending_seconds = _cfg_float(config, "tag_pending_seconds", 60)
         self.tag_forward_on_pending = _cfg_bool(config, "tag_forward_on_pending", True)
         self.tag_history_fallback = _cfg_bool(config, "tag_history_fallback", True)
@@ -109,6 +110,7 @@ class Sowing_Discord(Star):
             dedupe_seconds=self.tag_dedupe_seconds,
             forward_on_pending=self.tag_forward_on_pending,
             content_dedupe_seconds=self.tag_content_dedupe_seconds,
+            clock_skew_seconds=self.tag_clock_skew,
         )
         self._tag_lock = asyncio.Lock()
         self._last_tag_send_ts = 0.0
@@ -310,11 +312,11 @@ class Sowing_Discord(Star):
             is_tag = self.tagger.is_tag(meta)
             if is_tag:
                 logger.info(
-                    f"[SowingDiscord][ID:{self.instance_id}] 收到 tag 候选：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 内容: {meta.text!r}"
+                    f"[SowingDiscord][ID:{self.instance_id}] 收到 tag 候选：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 时间: {meta.ts:.0f}, 内容: {meta.text!r}"
                 )
             elif meta.is_media:
                 logger.info(
-                    f"[SowingDiscord][ID:{self.instance_id}] 观察到媒体消息：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 类型: {meta.kind}"
+                    f"[SowingDiscord][ID:{self.instance_id}] 观察到媒体消息：群: {meta.group_id}, 发送者: {meta.sender_id}, 消息 ID: {meta.message_id}, 时间: {meta.ts:.0f}, 类型: {meta.kind}"
                 )
 
             if self.tagger.needs_history(meta) and self.tag_history_fallback:
@@ -397,8 +399,14 @@ class Sowing_Discord(Star):
         if self.tagger.is_forwarded(prev_last):
             return f"上一条媒体已转发过，按重复 tag 忽略（ID: {prev_last.message_id}）"
         delta = meta.ts - prev_last.ts
+        if delta < -self.tag_clock_skew:
+            return (
+                f"上一条媒体的平台时间比 tag 晚 {-delta:.1f}s（史 ts={prev_last.ts:.0f}, "
+                f"tag ts={meta.ts:.0f}），超出允许的时钟偏差 {self.tag_clock_skew:g} 秒"
+            )
         return (
-            f"上一条媒体与 tag 间隔 {delta:.1f}s，超出 {window:g} 秒限制，"
+            f"上一条媒体与 tag 间隔 {delta:.1f}s，超出 {window:g} 秒限制"
+            f"（史 ts={prev_last.ts:.0f}, tag ts={meta.ts:.0f}），"
             f"已进入等待，同人 {self.tag_pending_seconds:g} 秒内补发媒体仍会转发"
         )
 

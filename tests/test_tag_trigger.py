@@ -121,6 +121,44 @@ def test_tag_window_boundary():
     assert trigger.observe(tag(2, 130.001)) is None  # 超过 30 秒
 
 
+def test_tag_matches_media_with_slightly_late_platform_time():
+    # 线上问题: 史事件先到, 但转发消息的平台时间比 tag 晚 1 秒;
+    # 事件顺序已经证明它在 tag 前面, 不能因为负时间差漏转
+    trigger = TagTrigger()
+    trigger.observe(media(1, 101.0))
+    action = trigger.observe(tag(2, 100.0))
+    assert action is not None
+    assert action.message_id == 1
+
+
+def test_clock_skew_boundary():
+    trigger = TagTrigger()
+    trigger.observe(media(1, 110.0))
+    assert trigger.observe(tag(2, 100.0)) is not None  # 恰好 -10 秒, 仍在偏差内
+
+    trigger = TagTrigger()
+    trigger.observe(media(1, 110.001))
+    assert trigger.observe(tag(2, 100.0)) is None  # 超出时钟偏差
+
+
+def test_clock_skew_is_configurable():
+    trigger = TagTrigger(clock_skew_seconds=0)
+    trigger.observe(media(1, 101.0))
+    assert trigger.observe(tag(2, 100.0)) is None
+
+
+def test_skew_matched_tag_does_not_leave_media_as_last():
+    trigger = TagTrigger()
+    trigger.observe(media(1, 101.0))
+    assert trigger.observe(tag(2, 100.0)).message_id == 1
+
+    # last 应更新为 tag 本身, 第二个 tag 进入等待而不是反复命中媒体 1
+    assert trigger.observe(tag(3, 100.5)) is None
+    action = trigger.observe(media(4, 120.0))
+    assert action is not None
+    assert action.message_id == 4
+
+
 def test_text_comment_breaks_adjacency_but_pending_still_waits():
     trigger = TagTrigger()
     trigger.observe(media(1, 100.0))

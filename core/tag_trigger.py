@@ -9,6 +9,8 @@
 - 匹配规则:
     * tag 的上一条消息恰好是同人的媒体消息, 且时间差 <= match_window_seconds
       -> 转发该媒体消息
+      (平台时间可能因转发消息/时钟偏差比 tag 略晚, 允许 -clock_skew_seconds
+       以内的负时间差; 否则会出现「史事件先到, 但平台时间比 tag 晚 1 秒」被漏转)
     * 否则 tag 进入 pending, 等待该发送者 pending 期间的下一条消息:
       - 是媒体消息且时间差 <= pending_seconds -> 转发该媒体消息
       - 是其它消息 -> 取消等待(严格相邻)
@@ -280,6 +282,7 @@ class TagTrigger:
         dedupe_seconds: float = 3600.0,
         forward_on_pending: bool = True,
         content_dedupe_seconds: float = 3600.0,
+        clock_skew_seconds: float = 10.0,
     ):
         self.prefix = prefix or "#"
         self.match_window_seconds = max(0.0, float(match_window_seconds))
@@ -287,6 +290,8 @@ class TagTrigger:
         self.dedupe_seconds = max(0.0, float(dedupe_seconds))
         self.forward_on_pending = bool(forward_on_pending)
         self.content_dedupe_seconds = max(0.0, float(content_dedupe_seconds))
+        # 平台时间可能比实际事件顺序略有偏差(尤其转发消息), 允许这个范围内的负时间差
+        self.clock_skew_seconds = max(0.0, float(clock_skew_seconds))
         self._states: Dict[Tuple[str, str], _SenderState] = {}
         self._forwarded: Dict[int, float] = {}
         # 已搬运过的消息指纹与内容哈希(用于跨消息 ID 的重复搬史检测)
@@ -385,8 +390,12 @@ class TagTrigger:
                     self._mark_forwarded(meta, meta.ts)
                 state.pending_tag = None
 
-        # 只有平台时间更新(或不更旧)的消息才覆盖 last, 避免迟到事件把状态往回拨
-        if state.last is None or meta.ts >= state.last.ts:
+        # 只有平台时间更新(或不更旧)的消息才覆盖 last, 避免迟到事件把状态往回拨;
+        # 但 tag 已经产生动作时, last 必须是 tag 本身, 否则「平台时间略晚的史」
+        # 会一直占着 last, 让后续重复 tag 反复命中同一条史
+        if action is not None and self.is_tag(meta):
+            state.last = meta
+        elif state.last is None or meta.ts >= state.last.ts:
             state.last = meta
 
         return action
@@ -539,7 +548,9 @@ class TagTrigger:
         if last.message_id == tag.message_id:
             return False
         delta = tag.ts - last.ts
-        return 0 <= delta <= self.match_window_seconds
+        # 允许小幅负时间差: 转发消息/适配器的平台时间可能比 tag 晚一点点,
+        # 但事件的到达顺序已经证明它就在 tag 前面, 不能因此漏转
+        return -self.clock_skew_seconds <= delta <= self.match_window_seconds
 
     def _is_replayed_tag(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
         """上一条就是窗口内已转发过的史: 视为重复 tag, 不再进入 pending。"""

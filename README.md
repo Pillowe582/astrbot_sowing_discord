@@ -59,7 +59,7 @@ https://sowingdiscord.ankaanka.org
      - `收到 tag 候选：...` / `收到 tag 候选，但群 xxx 不在 banshi_group_list ...` —— 确认群号是否配置正确
      - `观察到媒体消息：... 类型: image|video|forward` —— 确认史有没有被识别成媒体
      - `tag 未命中：...` —— 会直接写出原因(上一条不是媒体 / 间隔超出 / 已转发过去重 / 没有上一条记录)
-   - 常见原因: 史和 tag 间隔超过 30 秒; 中间夹了文字评论; 发送者不是同一人; 来源群不在 `banshi_group_list`; bot 重启后历史回填失败(接口不支持时该 tag 会被跳过)
+   - 常见原因: 史和 tag 间隔超过 30 秒; 中间夹了文字评论; 发送者不是同一人; 来源群不在 `banshi_group_list`; bot 重启后历史回填失败(接口不支持时该 tag 会被跳过)。转发消息的「平台时间晚于 tag 1~2 秒」属于正常时钟偏差, 已在 `tag_clock_skew_seconds`(默认 10 秒)内自动容忍
 
 3. **Q: 同一张史被搬来搬去, 怎么避免重复搬运?**
 
@@ -91,6 +91,7 @@ https://sowingdiscord.ankaanka.org
 - `trigger_mode`: 触发方式, `tag`(默认) 或 `emoji`(旧版)
 - `tag_prefix`: tag 触发前缀, 默认 `#`
 - `tag_match_window_seconds`: 史与 tag 的最大时间间隔(秒), 默认 30
+- `tag_clock_skew_seconds`: 允许的平台时间偏差(秒), 默认 10; 转发消息的平台时间可能比实际发送时间晚 1~2 秒, 该值内的负间隔仍按紧邻处理
 - `tag_pending_seconds`: tag 先于史时等待同一人发史的时间(秒), 默认 60
 - `tag_forward_on_pending`: 是否允许「tag 先到、史后到」也转发, 默认 true
 - `tag_history_fallback`: bot 重启后是否调用 `get_group_msg_history` 回填历史, 默认 true

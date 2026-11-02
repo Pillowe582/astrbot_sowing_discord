@@ -17,6 +17,12 @@
     "description": "史与 tag 的最大时间间隔 (秒)",
     "hint": "史在 tag 之前, 且两者间隔不超过该值时才会转发"
   },
+  "tag_clock_skew_seconds": {
+    "type": "int",
+    "default": 10,
+    "description": "允许的平台时间偏差 (秒)",
+    "hint": "转发消息的平台时间可能比实际发送时间略晚, 导致「史与 tag 间隔」出现 -1~-2 秒; 该值内的负间隔仍按紧邻处理"
+  },
   "tag_pending_seconds": {
     "type": "int",
     "default": 60,
