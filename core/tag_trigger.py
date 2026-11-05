@@ -5,7 +5,6 @@
 - 以 (group_id, sender_id) 为维度维护状态:
     last      该发送者最近一条消息(任意类型)
     pending   尚未匹配到史的 tag(默认 60 秒内有效)
-    forwarded 已转发消息 ID 的去重表(默认保留 1 小时)
 - 匹配规则:
     * tag 的上一条消息恰好是同人的媒体消息, 且时间差 <= match_window_seconds
       -> 转发该媒体消息
@@ -14,12 +13,8 @@
     * 否则 tag 进入 pending, 等待该发送者 pending 期间的下一条消息:
       - 是媒体消息且时间差 <= pending_seconds -> 转发该媒体消息
       - 是其它消息 -> 取消等待(严格相邻)
-    * 同一条媒体消息只转发一次(去重窗口内)
-- 重复史检测(两层):
-    * 消息指纹: 媒体消息的稳定标识(文件 id / 转发记录 id / 规范化 URL / 文本)
-      相同即视为重复, 不需要网络, 默认开启
-    * 内容哈希: 由上层下载媒体字节后算出 SHA-256 传入, 跨消息 ID / 跨转发容器
-      识别「同一张图被重新上传/套了转发卡片再来一次」
+- 重复检测不在这里做: 是否「目标群最近已经有了这条史」由发送层按目标群判断,
+  状态机只负责回答「这条 tag 应该转发哪条消息」。
 """
 
 from __future__ import annotations
@@ -36,9 +31,6 @@ TEXT_KIND = "text"
 OTHER_KIND = "other"
 
 _CQ_PATTERN = re.compile(r"\[CQ:.*?\]", re.S)
-_MAX_FORWARDED_ENTRIES = 5000
-_MAX_FINGERPRINT_ENTRIES = 5000
-_MAX_CONTENT_ENTRIES = 2000
 _MAX_RECENT_MESSAGES = 10
 
 # 部分适配器把媒体消息的 message_str 记成占位文本(组件列表为空)时的兜底
@@ -250,17 +242,13 @@ class MsgMeta:
 
 @dataclass
 class Action:
-    """状态机的输出。
-
-    kind="forward": 需要转发 message_id 对应的媒体消息
-    kind="duplicate": 命中的媒体在去重窗口内已经搬过, 跳过转发(只记日志)
-    """
+    """状态机的输出: 需要转发 message_id 对应的媒体消息。"""
 
     kind: str
     message_id: int
     media_kind: str = OTHER_KIND
     trigger_tag_id: Optional[int] = None
-    reason: str = ""
+    fingerprint: str = ""
 
 
 @dataclass
@@ -279,24 +267,16 @@ class TagTrigger:
         prefix: str = "#",
         match_window_seconds: float = 30.0,
         pending_seconds: float = 60.0,
-        dedupe_seconds: float = 3600.0,
         forward_on_pending: bool = True,
-        content_dedupe_seconds: float = 3600.0,
         clock_skew_seconds: float = 10.0,
     ):
         self.prefix = prefix or "#"
         self.match_window_seconds = max(0.0, float(match_window_seconds))
         self.pending_seconds = max(0.0, float(pending_seconds))
-        self.dedupe_seconds = max(0.0, float(dedupe_seconds))
         self.forward_on_pending = bool(forward_on_pending)
-        self.content_dedupe_seconds = max(0.0, float(content_dedupe_seconds))
         # 平台时间可能比实际事件顺序略有偏差(尤其转发消息), 允许这个范围内的负时间差
         self.clock_skew_seconds = max(0.0, float(clock_skew_seconds))
         self._states: Dict[Tuple[str, str], _SenderState] = {}
-        self._forwarded: Dict[int, float] = {}
-        # 已搬运过的消息指纹与内容哈希(用于跨消息 ID 的重复搬史检测)
-        self._forwarded_fingerprints: Dict[str, float] = {}
-        self._content_ids: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -351,43 +331,38 @@ class TagTrigger:
         if self.is_tag(meta):
             if self._can_match_tag(state.last, meta):
                 matched = state.last
-                action = Action("forward", matched.message_id, matched.kind, meta.message_id)
-                self._mark_forwarded(matched, meta.ts)
-                state.pending_tag = None
-            elif self._is_fingerprint_duplicate_tag(state.last, meta):
-                matched = state.last
                 action = Action(
-                    "duplicate",
+                    "forward",
                     matched.message_id,
                     matched.kind,
                     meta.message_id,
-                    reason="fingerprint",
+                    matched.fingerprint,
                 )
-                self._mark_forwarded(matched, meta.ts)
                 state.pending_tag = None
-            elif not self._is_replayed_tag(state.last, meta):
-                # 未命中且不是重复 tag -> 进入 pending, 等待同人的下一条消息
+            else:
+                # 未命中 -> 进入 pending, 等待同人的下一条消息
                 state.pending_tag = meta
         else:
             pending = state.pending_tag
             if pending is not None:
                 if self._can_match_pending(state, meta, pending):
                     # 正常顺序: 该发送者 pending 之后的下一条消息就是媒体
-                    action = Action("forward", meta.message_id, meta.kind, pending.message_id)
-                    self._mark_forwarded(meta, meta.ts)
-                elif self._can_match_late_media(state, meta, pending):
-                    # 乱序: 史实际先发出, 但事件比 tag 晚到, 按平台时间判断仍是紧邻的史
-                    action = Action("forward", meta.message_id, meta.kind, pending.message_id)
-                    self._mark_forwarded(meta, meta.ts)
-                elif self._is_fingerprint_duplicate_pending(state, meta, pending):
                     action = Action(
-                        "duplicate",
+                        "forward",
                         meta.message_id,
                         meta.kind,
                         pending.message_id,
-                        reason="fingerprint",
+                        meta.fingerprint,
                     )
-                    self._mark_forwarded(meta, meta.ts)
+                elif self._can_match_late_media(state, meta, pending):
+                    # 乱序: 史实际先发出, 但事件比 tag 晚到, 按平台时间判断仍是紧邻的史
+                    action = Action(
+                        "forward",
+                        meta.message_id,
+                        meta.kind,
+                        pending.message_id,
+                        meta.fingerprint,
+                    )
                 state.pending_tag = None
 
         # 只有平台时间更新(或不更旧)的消息才覆盖 last, 避免迟到事件把状态往回拨;
@@ -401,7 +376,7 @@ class TagTrigger:
         return action
 
     def expire(self, now: Optional[float] = None) -> None:
-        """清理过期的 pending 与去重记录(由 observe 自动调用, 也可手动调用)。"""
+        """清理过期的 pending(由 observe 自动调用, 也可手动调用)。"""
         self._prune(_now() if now is None else float(now))
 
     def last_for(self, meta: MsgMeta) -> Optional[MsgMeta]:
@@ -409,35 +384,10 @@ class TagTrigger:
         state = self._states.get((meta.group_id, meta.sender_id))
         return state.last if state else None
 
-    def is_forwarded(self, meta: MsgMeta) -> bool:
-        return meta.message_id in self._forwarded
-
-    def fingerprint_forwarded(self, fingerprint: str) -> bool:
-        """该消息指纹在去重窗口内是否已经搬运过。"""
-        return bool(fingerprint) and fingerprint in self._forwarded_fingerprints
-
     def has_pending(self, meta: MsgMeta) -> bool:
         """该发送者当前是否有等待中的 tag。"""
         state = self._states.get((meta.group_id, meta.sender_id))
         return bool(state is not None and state.pending_tag is not None)
-
-    # ------------------------------------------------------------------ #
-    # 内容哈希去重(字节级内容相同, 由上层计算后传入)
-    # ------------------------------------------------------------------ #
-    def content_duplicate(self, content_id: str, now: Optional[float] = None) -> bool:
-        """该内容哈希在去重窗口内是否已经搬运过。"""
-        if not content_id:
-            return False
-        self._prune(_now() if now is None else float(now))
-        return content_id in self._content_ids
-
-    def mark_content_forwarded(self, content_id: str, now: Optional[float] = None) -> None:
-        """记录一条内容哈希, 之后相同内容的重复史会被跳过。"""
-        if not content_id:
-            return
-        moment = _now() if now is None else float(now)
-        self._content_ids[content_id] = moment
-        self._prune(moment)
 
     # ------------------------------------------------------------------ #
     # 持久化
@@ -453,11 +403,8 @@ class TagTrigger:
             if item:
                 states[f"{group_id}|{sender_id}"] = item
         return {
-            "version": 2,
+            "version": 3,
             "states": states,
-            "forwarded": {str(message_id): ts for message_id, ts in self._forwarded.items()},
-            "fingerprints": dict(self._forwarded_fingerprints),
-            "content": dict(self._content_ids),
         }
 
     @classmethod
@@ -476,21 +423,6 @@ class TagTrigger:
                 if pending:
                     state.pending_tag = MsgMeta.from_dict(pending)
                 trigger._states[(group_id, sender_id)] = state
-            for message_id, ts in (data.get("forwarded") or {}).items():
-                try:
-                    trigger._forwarded[int(message_id)] = float(ts)
-                except (TypeError, ValueError):
-                    continue
-            for fingerprint, ts in (data.get("fingerprints") or {}).items():
-                try:
-                    trigger._forwarded_fingerprints[str(fingerprint)] = float(ts)
-                except (TypeError, ValueError):
-                    continue
-            for content_id, ts in (data.get("content") or {}).items():
-                try:
-                    trigger._content_ids[str(content_id)] = float(ts)
-                except (TypeError, ValueError):
-                    continue
         except (AttributeError, TypeError, ValueError):
             # 损坏的状态文件: 能读多少读多少, 读不了的直接丢弃
             pass
@@ -503,9 +435,7 @@ class TagTrigger:
         self, state: _SenderState, meta: MsgMeta, pending: MsgMeta
     ) -> bool:
         """正常顺序: tag 之后该发送者的*下一条*消息就是媒体。"""
-        if not self._adjacent_pending(state, meta, pending):
-            return False
-        return self._forwardable(meta)
+        return self._adjacent_pending(state, meta, pending)
 
     def _adjacent_pending(self, state: _SenderState, meta: MsgMeta, pending: MsgMeta) -> bool:
         if not meta.is_media or not self.forward_on_pending:
@@ -521,9 +451,7 @@ class TagTrigger:
 
         仅当两者按平台时间紧邻(中间没有该发送者的其它消息)时才匹配。
         """
-        if not self._adjacent_late_media(state, meta, pending):
-            return False
-        return self._forwardable(meta)
+        return self._adjacent_late_media(state, meta, pending)
 
     def _adjacent_late_media(self, state: _SenderState, meta: MsgMeta, pending: MsgMeta) -> bool:
         if not meta.is_media or not self.forward_on_pending:
@@ -538,9 +466,7 @@ class TagTrigger:
         return True
 
     def _can_match_tag(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
-        if last is None or not self._same_sender_media_within_window(last, tag):
-            return False
-        return self._forwardable(last)
+        return self._same_sender_media_within_window(last, tag)
 
     def _same_sender_media_within_window(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
         if last is None or not last.is_media:
@@ -552,66 +478,10 @@ class TagTrigger:
         # 但事件的到达顺序已经证明它就在 tag 前面, 不能因此漏转
         return -self.clock_skew_seconds <= delta <= self.match_window_seconds
 
-    def _is_replayed_tag(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
-        """上一条就是窗口内已转发过的史: 视为重复 tag, 不再进入 pending。"""
-        if not self._same_sender_media_within_window(last, tag):
-            return False
-        return last.message_id in self._forwarded
-
-    def _is_fingerprint_duplicate_tag(self, last: Optional[MsgMeta], tag: MsgMeta) -> bool:
-        """上一条媒体按消息 ID 没搬过, 但指纹表明内容已经搬过。"""
-        if not self._same_sender_media_within_window(last, tag):
-            return False
-        if last.message_id in self._forwarded:
-            return False
-        return self.fingerprint_forwarded(last.fingerprint)
-
-    def _is_fingerprint_duplicate_pending(
-        self, state: _SenderState, meta: MsgMeta, pending: MsgMeta
-    ) -> bool:
-        """pending 之后到达的媒体按指纹判断是重复史。"""
-        if not (self._adjacent_pending(state, meta, pending) or self._adjacent_late_media(state, meta, pending)):
-            return False
-        if meta.message_id in self._forwarded:
-            return False
-        return self.fingerprint_forwarded(meta.fingerprint)
-
-    def _forwardable(self, meta: MsgMeta) -> bool:
-        if meta.message_id in self._forwarded:
-            return False
-        return not self.fingerprint_forwarded(meta.fingerprint)
-
-    def _mark_forwarded(self, meta: MsgMeta, now: float) -> None:
-        self._forwarded[meta.message_id] = now
-        if len(self._forwarded) > _MAX_FORWARDED_ENTRIES:
-            overflow = len(self._forwarded) - _MAX_FORWARDED_ENTRIES
-            for message_id, _ in sorted(self._forwarded.items(), key=lambda kv: kv[1])[:overflow]:
-                self._forwarded.pop(message_id, None)
-
-        if meta.fingerprint:
-            self._forwarded_fingerprints[meta.fingerprint] = now
-            if len(self._forwarded_fingerprints) > _MAX_FINGERPRINT_ENTRIES:
-                overflow = len(self._forwarded_fingerprints) - _MAX_FINGERPRINT_ENTRIES
-                for fingerprint, _ in sorted(
-                    self._forwarded_fingerprints.items(), key=lambda kv: kv[1]
-                )[:overflow]:
-                    self._forwarded_fingerprints.pop(fingerprint, None)
-
     def _prune(self, now: float) -> None:
         for state in self._states.values():
             if state.pending_tag is not None and now - state.pending_tag.ts > self.pending_seconds:
                 state.pending_tag = None
-        if self.dedupe_seconds > 0:
-            for message_id, ts in list(self._forwarded.items()):
-                if now - ts > self.dedupe_seconds:
-                    self._forwarded.pop(message_id, None)
-            for fingerprint, ts in list(self._forwarded_fingerprints.items()):
-                if now - ts > self.dedupe_seconds:
-                    self._forwarded_fingerprints.pop(fingerprint, None)
-        if self.content_dedupe_seconds > 0:
-            for content_id, ts in list(self._content_ids.items()):
-                if now - ts > self.content_dedupe_seconds:
-                    self._content_ids.pop(content_id, None)
 
 
 def _now() -> float:

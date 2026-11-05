@@ -230,25 +230,19 @@ def test_second_tag_without_media_is_dropped():
     assert trigger.observe(media(4, 180.0)) is None
 
 
-def test_replayed_tag_after_pending_forward_does_not_wait():
+def test_second_tag_matches_same_media_in_matching_layer():
     trigger = TagTrigger()
     trigger.observe(tag(1, 100.0))
     action = trigger.observe(media(2, 110.0))
     assert action is not None
 
-    # 这条 tag 的上一句就是刚转发过的史 -> 视为重复 tag, 不再进入 pending
-    assert trigger.observe(tag(3, 115.0)) is None
+    # 匹配层仍会再次命中这条史(是否重复由发送层按目标群判断)
+    action = trigger.observe(tag(3, 115.0))
+    assert action is not None
+    assert action.message_id == 2
+
+    # tag 成为 last 后, 后续普通消息不会命中
     assert trigger.observe(media(4, 120.0)) is None
-
-
-def test_dedupe_prevents_double_forward():
-    trigger = TagTrigger()
-    trigger.observe(media(1, 100.0))
-    trigger.observe(tag(2, 105.0))
-
-    # 重复 tag 让状态机进入 pending, 但下一条仍是这条已转发的史时不会被再次转发
-    trigger.observe(tag(3, 108.0))
-    assert trigger.observe(media(1, 109.0)) is None
 
 
 def test_other_sender_does_not_break_adjacency():
@@ -393,14 +387,20 @@ def test_diagnostic_helpers():
     trigger.observe(media(1, 100.0))
     last = trigger.last_for(tag(2, 105.0))
     assert last is not None and last.message_id == 1
-    assert trigger.is_forwarded(media(1, 100.0)) is False
     assert trigger.has_pending(tag(2, 105.0)) is False
 
     assert trigger.observe(tag(2, 105.0)) is not None
-    assert trigger.is_forwarded(media(1, 100.0)) is True
 
 
-def test_state_roundtrip_keeps_dedupe_and_pending():
+def test_action_carries_matched_fingerprint():
+    trigger = TagTrigger()
+    trigger.observe(fp_media(1, 100.0, "ffff"))
+    action = trigger.observe(tag(2, 105.0))
+    assert action is not None
+    assert action.fingerprint == "ffff"
+
+
+def test_state_roundtrip_keeps_pending_and_last():
     trigger = TagTrigger()
     trigger.observe(media(1, 100.0))
     trigger.observe(tag(2, 105.0))  # 转发 media(1)
@@ -413,13 +413,9 @@ def test_state_roundtrip_keeps_dedupe_and_pending():
     assert action is not None
     assert action.message_id == 4
 
-    # 已转发记录仍在 -> 重复 tag 不会让后续媒体被转发
-    assert restored.observe(tag(5, 111.0)) is None
-    assert restored.observe(media(6, 120.0)) is None
-
 
 def test_from_dict_tolerates_broken_data():
-    trigger = TagTrigger.from_dict({"states": "not-a-dict", "forwarded": {"bad": "x"}})
+    trigger = TagTrigger.from_dict({"states": "not-a-dict"})
     assert trigger.observe(tag(1, 100.0)) is None
 
 
@@ -477,91 +473,12 @@ def test_message_fingerprint_components():
     )
 
 
-def test_fingerprint_dedupe_skips_same_content_with_new_message_id():
-    trigger = TagTrigger()
-    assert trigger.observe(fp_media(1, 100.0, "ffff")) is None
-    assert trigger.observe(tag(2, 105.0)).kind == "forward"
+def test_from_dict_old_version_data_is_ignored():
+    # 旧版状态文件里的 forwarded/fingerprints/content 去重字段已迁移到发送层
+    trigger = TagTrigger.from_dict(
+        {"version": 2, "states": {}, "forwarded": {"1": 100.0}, "content": {"cid": 100.0}}
+    )
+    action = trigger.observe(media(1, 100.0))
+    assert action is None
+    assert trigger.observe(tag(2, 105.0)).message_id == 1
 
-    # 同内容的新消息(新消息 ID, 同指纹), 再发 tag -> 判定为重复史
-    assert trigger.observe(fp_media(3, 200.0, "ffff")) is None
-    action = trigger.observe(tag(4, 205.0))
-    assert action is not None
-    assert action.kind == "duplicate"
-    assert action.message_id == 3
-    assert action.reason == "fingerprint"
-
-
-def test_fingerprint_dedupe_expires_after_window():
-    trigger = TagTrigger(dedupe_seconds=100)
-    trigger.observe(fp_media(1, 100.0, "ffff"))
-    trigger.observe(tag(2, 105.0))
-
-    # 超过去重窗口后, 同指纹的史可以再次搬运
-    assert trigger.observe(fp_media(3, 300.0, "ffff")) is None
-    action = trigger.observe(tag(4, 305.0))
-    assert action is not None
-    assert action.kind == "forward"
-    assert action.message_id == 3
-
-
-def test_fingerprint_dedupe_in_pending_branch():
-    trigger = TagTrigger()
-    trigger.observe(fp_media(1, 100.0, "ffff"))
-    trigger.observe(tag(2, 105.0))
-
-    trigger.observe(tag(3, 110.0))  # pending
-    action = trigger.observe(fp_media(4, 115.0, "ffff"))
-    assert action is not None
-    assert action.kind == "duplicate"
-    assert action.message_id == 4
-
-
-def test_fingerprint_does_not_change_message_id_dedupe():
-    trigger = TagTrigger()
-    trigger.observe(media(1, 100.0))  # 无指纹
-    trigger.observe(tag(2, 105.0))
-    # 同一条消息再次出现(同消息 ID) -> 静默, 不产生 duplicate Action
-    trigger.observe(tag(3, 108.0))
-    assert trigger.observe(media(1, 109.0)) is None
-
-
-# --------------------------------------------------------------------------- #
-# 内容哈希(字节级去重, 哈希由上层计算后传入)
-# --------------------------------------------------------------------------- #
-def test_content_dedupe_window():
-    trigger = TagTrigger(content_dedupe_seconds=100)
-    assert trigger.content_duplicate("cid") is False
-
-    trigger.mark_content_forwarded("cid", now=100.0)
-    assert trigger.content_duplicate("cid", now=150.0) is True
-    assert trigger.content_duplicate("cid", now=250.0) is False  # 过期
-
-
-def test_content_dedupe_ignores_empty():
-    trigger = TagTrigger()
-    assert trigger.content_duplicate("") is False
-    trigger.mark_content_forwarded("")
-    assert trigger.content_duplicate("") is False
-
-
-def test_state_roundtrip_keeps_fingerprints_and_content():
-    trigger = TagTrigger(content_dedupe_seconds=3600)
-    trigger.observe(fp_media(1, 100.0, "ffff"))
-    trigger.observe(tag(2, 105.0))
-    trigger.mark_content_forwarded("cid", now=105.0)
-
-    restored = TagTrigger.from_dict(trigger.to_dict())
-    assert restored.fingerprint_forwarded("ffff") is True
-    assert restored.content_duplicate("cid", now=110.0) is True
-
-    # 重启后同指纹的史仍然会被判重
-    restored.observe(fp_media(3, 200.0, "ffff"))
-    action = restored.observe(tag(4, 205.0))
-    assert action is not None and action.kind == "duplicate"
-
-
-def test_from_dict_old_version_without_new_fields():
-    trigger = TagTrigger.from_dict({"version": 1, "states": {}, "forwarded": {"1": 100.0}})
-    assert trigger.is_forwarded(media(1, 100.0)) is True
-    assert trigger.fingerprint_forwarded("ffff") is False
-    assert trigger.content_duplicate("cid") is False

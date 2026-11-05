@@ -19,6 +19,7 @@ from .core.tag_trigger import (
 )
 from .core.tag_history import fetch_recent_messages
 from .core.media_hash import compute_media_content_id
+from .core.target_dedupe import TargetDedupe
 from .storage.local_cache import LocalCache
 from .config import TEMP_DIR
 import asyncio
@@ -48,7 +49,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.4")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.5")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -107,10 +108,13 @@ class Sowing_Discord(Star):
             prefix=self.tag_prefix,
             match_window_seconds=self.tag_match_window,
             pending_seconds=self.tag_pending_seconds,
-            dedupe_seconds=self.tag_dedupe_seconds,
             forward_on_pending=self.tag_forward_on_pending,
-            content_dedupe_seconds=self.tag_content_dedupe_seconds,
             clock_skew_seconds=self.tag_clock_skew,
+        )
+        # 重复史检测按目标群隔离: 只跳过「最近已经收到过相同史」的目标群, 不看其它群
+        self.target_dedupe = TargetDedupe(
+            fingerprint_seconds=self.tag_dedupe_seconds,
+            content_seconds=self.tag_content_dedupe_seconds,
         )
         self._tag_lock = asyncio.Lock()
         self._last_tag_send_ts = 0.0
@@ -216,9 +220,13 @@ class Sowing_Discord(Star):
                 prefix=self.tag_prefix,
                 match_window_seconds=self.tag_match_window,
                 pending_seconds=self.tag_pending_seconds,
-                dedupe_seconds=self.tag_dedupe_seconds,
                 forward_on_pending=self.tag_forward_on_pending,
-                content_dedupe_seconds=self.tag_content_dedupe_seconds,
+                clock_skew_seconds=self.tag_clock_skew,
+            )
+            self.target_dedupe = TargetDedupe.from_dict(
+                data.get("dedupe") or {},
+                fingerprint_seconds=self.tag_dedupe_seconds,
+                content_seconds=self.tag_content_dedupe_seconds,
             )
             logger.info(
                 f"[SowingDiscord][ID:{self.instance_id}] 已加载 tag 状态: {self.tag_state_file}"
@@ -231,6 +239,7 @@ class Sowing_Discord(Star):
     def _save_tag_state(self):
         try:
             data = self.tagger.to_dict()
+            data["dedupe"] = self.target_dedupe.to_dict()
             tmp_path = self.tag_state_file + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
@@ -344,12 +353,6 @@ class Sowing_Discord(Star):
                 )
             return
 
-        if action.kind == "duplicate":
-            logger.info(
-                f"[SowingDiscord][ID:{self.instance_id}] 检测到重复史（消息指纹与最近 {self.tag_dedupe_seconds:g} 秒内已搬运过的史相同），跳过转发 (消息 ID: {action.message_id}, 触发 tag: {action.trigger_tag_id})。"
-            )
-            return
-
         if action.media_kind not in self.allowed_msg_types:
             logger.info(
                 f"[SowingDiscord][ID:{self.instance_id}] tag 命中的消息类型 {action.media_kind} 不在 allowed_message_types 中，跳过转发 (消息 ID: {action.message_id})。"
@@ -366,25 +369,15 @@ class Sowing_Discord(Star):
                 allow_video=self.tag_content_dedupe_video,
                 ffmpeg_path=self.tag_content_dedupe_ffmpeg,
             )
-            if content_id:
-                if self.tagger.content_duplicate(content_id):
-                    logger.info(
-                        f"[SowingDiscord][ID:{self.instance_id}] 检测到重复史（内容哈希 {content_id[:12]}… 与最近 {self.tag_content_dedupe_seconds:g} 秒内已搬运的一致），跳过转发 (消息 ID: {action.message_id})。"
-                    )
-                    self._save_tag_state()
-                    return
-            else:
+            if content_id is None:
                 logger.debug(
-                    f"[SowingDiscord][ID:{self.instance_id}] 内容哈希不可用（无媒体/下载失败/超过大小限制），本次仅按消息指纹去重 (消息 ID: {action.message_id})。"
+                    f"[SowingDiscord][ID:{self.instance_id}] 内容哈希不可用（无媒体/下载失败/超过大小限制），本次按消息指纹判断重复 (消息 ID: {action.message_id})。"
                 )
 
         logger.info(
-            f"[SowingDiscord][ID:{self.instance_id}] tag 命中：转发消息 (ID: {action.message_id}, 类型: {action.media_kind})，触发 tag: {action.trigger_tag_id}。"
+            f"[SowingDiscord][ID:{self.instance_id}] tag 命中：准备转发消息 (ID: {action.message_id}, 类型: {action.media_kind})，触发 tag: {action.trigger_tag_id}。"
         )
-        forwarded = await self._send_tag_forward(event, action)
-        if content_id and forwarded:
-            self.tagger.mark_content_forwarded(content_id)
-            self._save_tag_state()
+        await self._send_tag_forward(event, action, content_id or "")
 
     def _explain_tag_miss(self, meta: MsgMeta, prev_last) -> str:
         """给「tag 没命中」生成人话原因，方便线上排查。"""
@@ -396,8 +389,6 @@ class Sowing_Discord(Star):
                 f"上一条不是媒体（ID: {prev_last.message_id}, 类型: {prev_last.kind}），"
                 f"已进入等待，同人 {self.tag_pending_seconds:g} 秒内补发媒体仍会转发"
             )
-        if self.tagger.is_forwarded(prev_last):
-            return f"上一条媒体已转发过，按重复 tag 忽略（ID: {prev_last.message_id}）"
         delta = meta.ts - prev_last.ts
         if delta < -self.tag_clock_skew:
             return (
@@ -418,13 +409,27 @@ class Sowing_Discord(Star):
             self.banshi_target_list = groups
         return list(groups)
 
-    async def _send_tag_forward(self, event: AstrMessageEvent, action) -> bool:
-        """把命中的史转发到所有目标群(串行, 队列化); 至少成功一个目标群返回 True。"""
+    async def _send_tag_forward(
+        self, event: AstrMessageEvent, action, content_id: str = ""
+    ) -> bool:
+        """按目标群去重后转发命中的史(串行, 队列化); 至少成功一个目标群返回 True。"""
         targets = await self._resolve_targets(event)
         if not targets:
             logger.warning(
                 f"[SowingDiscord][ID:{self.instance_id}] 没有可用的目标群，跳过转发 (消息 ID: {action.message_id})。"
             )
+            return False
+
+        # 只跳过「该目标群最近已经收到过同一条史」的目标群, 不看其它群
+        pending_targets, skipped_targets = self.target_dedupe.filter_targets(
+            targets, action.fingerprint, content_id
+        )
+        if skipped_targets:
+            logger.info(
+                f"[SowingDiscord][ID:{self.instance_id}] 以下目标群最近已有相同史，跳过转发 (消息 ID: {action.message_id})："
+                f"{'、'.join(str(t) for t in skipped_targets)}。"
+            )
+        if not pending_targets:
             return False
 
         sent_any = False
@@ -436,10 +441,13 @@ class Sowing_Discord(Star):
                 if wait_seconds > 0:
                     await asyncio.sleep(wait_seconds)
 
-            for target_id in targets:
+            for target_id in pending_targets:
                 try:
                     await forward_single_msg(event.bot, action.message_id, target_id)
                     sent_any = True
+                    self.target_dedupe.mark_sent(
+                        target_id, action.fingerprint, content_id
+                    )
                     logger.info(
                         f"[SowingDiscord][ID:{self.instance_id}] 成功转发消息 (ID: {action.message_id}) 到目标群: {target_id}。"
                     )
@@ -459,6 +467,9 @@ class Sowing_Discord(Star):
                     f"[SowingDiscord][ID:{self.instance_id}] tag 冷却开始：时长 {self.tag_cooldown_seconds} 秒 (持有锁)。"
                 )
                 await asyncio.sleep(self.tag_cooldown_seconds)
+
+        if sent_any:
+            self._save_tag_state()
         return sent_any
 
     # ------------------------------------------------------------------ #
