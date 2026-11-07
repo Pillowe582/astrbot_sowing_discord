@@ -49,7 +49,7 @@ def _cfg_bool(config: dict, key: str, default: bool) -> bool:
     return bool(config.get(key, default))
 
 
-@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.5")
+@register("astrbot_sowing_discord", "anka", "anka - 搬史插件", "0.92.6")
 class Sowing_Discord(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -84,14 +84,12 @@ class Sowing_Discord(Star):
         self.tag_forward_on_pending = _cfg_bool(config, "tag_forward_on_pending", True)
         self.tag_history_fallback = _cfg_bool(config, "tag_history_fallback", True)
         self.tag_history_count = _cfg_int(config, "tag_history_count", 50)
-        self.tag_dedupe_seconds = _cfg_float(config, "tag_dedupe_seconds", 3600)
+        # 重复史检测按「条数」保留: 每个目标群最近 N 条已搬记录都参与判断, 不按时间过期
+        self.tag_dedupe_max_records = _cfg_int(config, "tag_dedupe_max_records", 500)
         self.tag_cooldown_seconds = _cfg_float(config, "tag_cooldown_seconds", 0)
 
         # 重复史检测: 消息指纹(免网络) + 媒体内容哈希(下载字节, 默认只算图片)
         self.tag_content_dedupe = _cfg_bool(config, "tag_content_dedupe", True)
-        self.tag_content_dedupe_seconds = _cfg_float(
-            config, "tag_content_dedupe_seconds", 3600
-        )
         self.tag_content_dedupe_max_bytes = _cfg_int(
             config, "tag_content_dedupe_max_bytes", 8 * 1024 * 1024
         )
@@ -112,10 +110,7 @@ class Sowing_Discord(Star):
             clock_skew_seconds=self.tag_clock_skew,
         )
         # 重复史检测按目标群隔离: 只跳过「最近已经收到过相同史」的目标群, 不看其它群
-        self.target_dedupe = TargetDedupe(
-            fingerprint_seconds=self.tag_dedupe_seconds,
-            content_seconds=self.tag_content_dedupe_seconds,
-        )
+        self.target_dedupe = TargetDedupe(max_records=self.tag_dedupe_max_records)
         self._tag_lock = asyncio.Lock()
         self._last_tag_send_ts = 0.0
         self._load_tag_state()
@@ -225,8 +220,7 @@ class Sowing_Discord(Star):
             )
             self.target_dedupe = TargetDedupe.from_dict(
                 data.get("dedupe") or {},
-                fingerprint_seconds=self.tag_dedupe_seconds,
-                content_seconds=self.tag_content_dedupe_seconds,
+                max_records=self.tag_dedupe_max_records,
             )
             logger.info(
                 f"[SowingDiscord][ID:{self.instance_id}] 已加载 tag 状态: {self.tag_state_file}"

@@ -132,8 +132,62 @@ def normalize_url(url) -> str:
         return url.strip()
 
 
+def _is_placeholder_text(text) -> bool:
+    """适配器只给了 "[图片]/[聊天记录]" 这类占位文本时返回 True。
+
+    占位文本不是内容标识: 如果拿它做指纹, 所有聊天记录会得到同一个指纹,
+    导致「内容完全不同的两条史」被误判成重复。
+    """
+    return isinstance(text, str) and text.strip() in _PLACEHOLDER_KINDS
+
+
+def _to_plain(value, depth: int = 0):
+    """把 Component/dict 递归转成可稳定序列化的普通结构(用于内容摘要)。"""
+    if depth > 6:
+        return "<deep>"
+    if isinstance(value, dict):
+        return {str(key): _to_plain(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(item, depth + 1) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    token = {"type": value.__class__.__name__.lower()}
+    for attr in (
+        "text",
+        "file",
+        "path",
+        "file_id",
+        "url",
+        "id",
+        "res_id",
+        "message_id",
+        "forward_id",
+        "qq",
+        "data",
+        "content",
+    ):
+        try:
+            attr_value = getattr(value, attr)
+        except Exception:
+            continue
+        if attr_value is not None:
+            token[attr] = _to_plain(attr_value, depth + 1)
+    return token
+
+
+def _content_digest(value) -> str:
+    payload = json.dumps(
+        _to_plain(value), ensure_ascii=False, sort_keys=True, default=str
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _segment_token(seg) -> dict:
-    """把一个消息段转成便于比较/哈希的稳定 token。"""
+    """把一个消息段转成便于比较/哈希的稳定 token。
+
+    只有能标识内容的字段(id/文件/URL/文本/内嵌内容)才会进入 token;
+    占位文本("[图片]"等)会被忽略, 避免所有媒体消息撞同一个指纹。
+    """
     if isinstance(seg, dict):
         seg_type = str(seg.get("type", "")).lower()
         data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
@@ -144,6 +198,8 @@ def _segment_token(seg) -> dict:
             ("file_id", "f"),
             ("id", "i"),
             ("res_id", "i"),
+            ("message_id", "i"),
+            ("forward_id", "i"),
         ):
             value = data.get(key)
             if isinstance(value, (str, int)) and str(value).strip():
@@ -153,14 +209,12 @@ def _segment_token(seg) -> dict:
             token["u"] = normalize_url(url)
         if seg_type in ("text", "plain"):
             text = data.get("text")
-            if isinstance(text, str) and text:
+            if isinstance(text, str) and text and not _is_placeholder_text(text):
                 token["tx"] = text
         else:
             content = data.get("content") or data.get("messages")
             if content is not None:
-                token["c"] = hashlib.sha256(
-                    json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-                ).hexdigest()[:16]
+                token["c"] = _content_digest(content)
         return token
 
     cname = seg.__class__.__name__.lower()
@@ -170,31 +224,62 @@ def _segment_token(seg) -> dict:
         if isinstance(value, str) and value.strip():
             token["f"] = value
             break
+    for attr in ("id", "res_id", "message_id", "forward_id"):
+        value = getattr(seg, attr, None)
+        if isinstance(value, (str, int)) and str(value).strip():
+            token["i"] = str(value)
+            break
     url = getattr(seg, "url", None)
     if isinstance(url, str) and url:
         token["u"] = normalize_url(url)
     if cname in ("plain", "text"):
         text = getattr(seg, "text", None)
-        if isinstance(text, str) and text:
+        if isinstance(text, str) and text and not _is_placeholder_text(text):
             token["tx"] = text
+    else:
+        content = None
+        for attr in ("content", "data", "messages"):
+            value = getattr(seg, attr, None)
+            if value is not None:
+                content = value
+                break
+        if content is not None:
+            token["c"] = _content_digest(content)
+    if cname == "at":
+        qq = getattr(seg, "qq", None)
+        if qq is not None:
+            token["i"] = str(qq)
     return token
 
 
-def message_fingerprint(message, text: str = "") -> str:
-    """计算消息内容指纹: 文件 id / 转发记录 id / 规范化 URL / 文本。
+def _token_has_identity(token: dict) -> bool:
+    """token 里是否含有能标识消息内容的字段(只有类型不算)。"""
+    return any(key in token for key in ("f", "i", "u", "tx", "c"))
 
-    返回 32 位十六进制字符串; 消息为空时返回空字符串(表示无法去重)。
+
+def message_fingerprint(message, text: str = "") -> str:
+    """计算消息内容指纹: 文件 id / 转发记录 id / 规范化 URL / 文本 / 内嵌内容。
+
+    返回 32 位十六进制字符串; 消息里没有任何可标识内容(例如只有
+    "[聊天记录]" 占位文本)时返回空字符串, 表示这一维无法去重,
+    交由内容哈希(下载字节/内嵌文本)判断, 避免占位文本误判重复。
     """
     if isinstance(message, (list, tuple)):
-        tokens = [_segment_token(seg) for seg in message]
-    elif isinstance(message, str) and message.strip():
+        tokens = [
+            token
+            for token in (_segment_token(seg) for seg in message)
+            if _token_has_identity(token)
+        ]
+    elif isinstance(message, str) and message.strip() and not _is_placeholder_text(message):
         tokens = [{"t": "raw", "tx": message.strip()}]
     else:
         tokens = []
-    if not tokens:
+
+    clean_text = "" if _is_placeholder_text(text) else (text or "").strip()
+    if not tokens and not clean_text:
         return ""
     payload = json.dumps(
-        {"segments": tokens, "text": (text or "").strip()},
+        {"segments": tokens, "text": clean_text},
         ensure_ascii=False,
         sort_keys=True,
     )

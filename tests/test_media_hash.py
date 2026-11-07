@@ -152,9 +152,109 @@ def test_compute_content_id_from_forward_card(monkeypatch):
     assert content_id == hashlib.sha256(b"abc").hexdigest()
 
 
-def test_compute_content_id_returns_none_without_media():
+def test_compute_content_id_includes_text_content():
+    """纯文字聊天记录也要能算出内容 ID(否则这类史完全无法去重)。"""
     bot = FakeBot({"get_msg": {"message": [{"type": "text", "data": {"text": "hi"}}]}})
+    content_id = asyncio.run(media_hash.compute_media_content_id(bot, 1))
+    expected = hashlib.sha256(
+        media_hash._text_part("hi").encode("utf-8")
+    ).hexdigest()
+    assert content_id == expected
+
+    other = FakeBot(
+        {"get_msg": {"message": [{"type": "text", "data": {"text": "hello"}}]}}
+    )
+    assert asyncio.run(media_hash.compute_media_content_id(other, 1)) != content_id
+
+
+def test_compute_content_id_placeholder_text_is_ignored():
+    bot = FakeBot(
+        {"get_msg": {"message": [{"type": "text", "data": {"text": "[图片]"}}]}}
+    )
     assert asyncio.run(media_hash.compute_media_content_id(bot, 1)) is None
+
+
+def test_compute_content_id_returns_none_without_content():
+    bot = FakeBot({"get_msg": {"message": []}})
+    assert asyncio.run(media_hash.compute_media_content_id(bot, 1)) is None
+
+
+def test_compute_content_id_text_affects_image_content_id(monkeypatch):
+    monkeypatch.setattr(
+        media_hash, "_download_sha256", lambda url, max_bytes, timeout: "abc"
+    )
+    message = [
+        {"type": "image", "data": {"url": "http://x/1"}},
+        {"type": "text", "data": {"text": "配文 A"}},
+    ]
+    bot = FakeBot({"get_msg": {"message": message}})
+    first = asyncio.run(media_hash.compute_media_content_id(bot, 1))
+
+    other = FakeBot(
+        {
+            "get_msg": {
+                "message": [
+                    {"type": "image", "data": {"url": "http://x/1"}},
+                    {"type": "text", "data": {"text": "配文 B"}},
+                ]
+            }
+        }
+    )
+    second = asyncio.run(media_hash.compute_media_content_id(other, 1))
+
+    assert first is not None
+    assert first != second
+
+
+def test_forward_card_text_and_media_both_count(monkeypatch):
+    """聊天记录里的文字/图片都要参与内容 ID。"""
+    monkeypatch.setattr(
+        media_hash, "_download_sha256", lambda url, max_bytes, timeout: "abc"
+    )
+    payload = {
+        "messages": [
+            {
+                "type": "node",
+                "data": {
+                    "content": [
+                        {"type": "text", "data": {"text": "第一层"}},
+                        {"type": "image", "data": {"url": "http://x/1"}},
+                    ]
+                },
+            }
+        ]
+    }
+    bot = FakeBot(
+        {
+            "get_msg": {"message": [{"type": "forward", "data": {"id": "77"}}]},
+            "get_forward_msg": payload,
+        }
+    )
+    content_id = asyncio.run(media_hash.compute_media_content_id(bot, 456))
+    assert content_id is not None
+
+    other = FakeBot(
+        {
+            "get_msg": {"message": [{"type": "forward", "data": {"id": "78"}}]},
+            "get_forward_msg": {
+                "messages": [
+                    {
+                        "type": "node",
+                        "data": {
+                            "content": [
+                                {"type": "text", "data": {"text": "另一段聊天"}},
+                                {
+                                    "type": "image",
+                                    "data": {"url": "http://x/1"},
+                                },
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+    )
+    assert asyncio.run(media_hash.compute_media_content_id(other, 456)) != content_id
 
 
 def test_compute_content_id_tolerates_api_errors():

@@ -482,3 +482,46 @@ def test_from_dict_old_version_data_is_ignored():
     assert action is None
     assert trigger.observe(tag(2, 105.0)).message_id == 1
 
+
+def test_placeholder_text_does_not_count_as_fingerprint():
+    # 只有占位文本的消息(不同聊天记录显示出来都是 "[聊天记录]")不应得到相同指纹
+    assert message_fingerprint([{"type": "text", "data": {"text": "[聊天记录]"}}]) == ""
+    assert message_fingerprint([{"type": "text", "data": {"text": "[图片]"}}]) == ""
+    assert message_fingerprint("") == ""
+
+
+def test_placeholder_text_is_ignored_beside_real_content():
+    real = [{"type": "image", "data": {"file": "abc.image"}}]
+    assert message_fingerprint(real) == message_fingerprint(
+        real + [{"type": "text", "data": {"text": "[图片]"}}]
+    )
+
+
+def test_forward_card_identity_changes_fingerprint():
+    first = [{"type": "forward", "data": {"id": "100"}}]
+    second = [{"type": "forward", "data": {"id": "200"}}]
+    assert message_fingerprint(first) != ""
+    assert message_fingerprint(first) != message_fingerprint(second)
+
+
+def test_forward_card_uses_inner_content_for_fingerprint():
+    class Forward:
+        def __init__(self, content):
+            self.content = content
+
+    one = [Forward([{"type": "text", "data": {"text": "第一条聊天记录"}}])]
+    two = [Forward([{"type": "text", "data": {"text": "第二条聊天记录"}}])]
+    assert message_fingerprint(one) != ""
+    assert message_fingerprint(one) != message_fingerprint(two)
+
+
+def test_forward_component_message_id_identity():
+    class Forward:
+        def __init__(self, message_id):
+            self.message_id = message_id
+
+    one = [Forward("100")]
+    two = [Forward("200")]
+    assert message_fingerprint(one) != message_fingerprint(two)
+
+

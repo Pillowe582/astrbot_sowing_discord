@@ -21,6 +21,8 @@ import shutil
 import urllib.request
 from typing import Dict, Iterable, List, Optional
 
+from .tag_trigger import _is_placeholder_text
+
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10.0
 # ffmpeg 不可用时, 取视频开头这么多字节做 SHA-256(近似首帧/文件头)
@@ -87,9 +89,15 @@ def extract_media_urls(message, allow_video: bool = False) -> List[str]:
     return urls
 
 
-def _walk_forward_media(payload, allow_video: bool = False) -> List[tuple]:
-    """递归遍历转发卡片内容, 收集其中的 (类型, URL)(防止转发套转发)。"""
+def _walk_forward_parts(payload, allow_video: bool = False) -> tuple:
+    """递归遍历转发卡片, 收集其中的 (媒体, 文本) 内容。
+
+    转发卡片必须按「里面到底有什么」去重: 只哈希卡片 id 或
+    "[聊天记录]"占位文本的话, 不同聊天记录会撞同一个特征。
+    返回 ([(类型, URL)], [文本...])。
+    """
     media: List[tuple] = []
+    texts: List[str] = []
     visited = 0
 
     def walk(node) -> None:
@@ -106,6 +114,12 @@ def _walk_forward_media(payload, allow_video: bool = False) -> List[tuple]:
                 if url:
                     media.append((seg_type, url))
                 return
+            if seg_type in ("text", "plain"):
+                data = node.get("data") if isinstance(node.get("data"), dict) else {}
+                value = data.get("text")
+                if isinstance(value, str) and value.strip():
+                    texts.append(value)
+                return
             for value in node.values():
                 walk(value)
         elif isinstance(node, (list, tuple)):
@@ -113,7 +127,12 @@ def _walk_forward_media(payload, allow_video: bool = False) -> List[tuple]:
                 walk(item)
 
     walk(payload)
-    return media
+    return media, texts
+
+
+def _walk_forward_media(payload, allow_video: bool = False) -> List[tuple]:
+    """兼容旧调用: 只收集转发卡片里的媒体。"""
+    return _walk_forward_parts(payload, allow_video=allow_video)[0]
 
 
 def _walk_forward_images(payload) -> List[str]:
@@ -288,7 +307,22 @@ def _as_int(value):
         return None
 
 
-async def _media_hashes_in_segments(
+def _text_part(text: str) -> str:
+    """文本内容的哈希片段(带 tx: 前缀, 与媒体哈希区分)。"""
+    return "tx:" + hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _segment_text(segment) -> str:
+    if not isinstance(segment, dict):
+        return ""
+    data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+    value = data.get("text")
+    if isinstance(value, str) and value.strip():
+        return value
+    return ""
+
+
+async def _content_parts_in_segments(
     bot,
     segments: list,
     *,
@@ -298,9 +332,22 @@ async def _media_hashes_in_segments(
     max_parts: int,
     ffmpeg_path: str = "",
 ) -> List[str]:
-    hashes: List[str] = []
+    """收集一条消息的内容片段: 媒体字节哈希 + 文本哈希 + 转发卡内嵌内容。
+
+    文本也要参与: 聊天记录常常只有文字, 只哈希媒体会让这类史完全无法去重;
+    同时文本参与后, 两张图配不同文字也不会被误判成同一条史。
+    """
+    parts: List[str] = []
+    seen = set()
+
+    def add(part: Optional[str]) -> None:
+        if not part or part in seen or len(parts) >= max_parts:
+            return
+        seen.add(part)
+        parts.append(part)
+
     for segment in segments:
-        if len(hashes) >= max_parts:
+        if len(parts) >= max_parts:
             break
         seg_type = (
             str(segment.get("type", "")).lower() if isinstance(segment, dict) else ""
@@ -308,35 +355,44 @@ async def _media_hashes_in_segments(
         if seg_type == "image":
             url = _segment_url(segment, allow_video=False)
             if url:
-                digest = await _hash_url(url, max_bytes, timeout)
-                if digest:
-                    hashes.append(digest)
+                add(await _hash_url(url, max_bytes, timeout))
                 continue
         elif seg_type == "video" and allow_video:
             url = _segment_url(segment, allow_video=True)
             if url:
-                digest = await _video_hash(url, timeout=timeout, ffmpeg_path=ffmpeg_path)
-                if digest:
-                    hashes.append(digest)
+                add(await _video_hash(url, timeout=timeout, ffmpeg_path=ffmpeg_path))
                 continue
+        elif seg_type in ("text", "plain"):
+            text = _segment_text(segment)
+            if text and not _is_placeholder_text(text):
+                add(_text_part(text))
+            continue
         if isinstance(segment, dict) and seg_type in ("forward", "node", "nodes"):
-            payload = await _fetch_forward_payload(bot, segment)
+            payload = None
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+            inline = data.get("content") or data.get("messages")
+            if inline is not None:
+                payload = inline
+            if payload is None:
+                payload = await _fetch_forward_payload(bot, segment)
             if payload is None:
                 continue
-            for media_type, inner_url in _walk_forward_media(
-                payload, allow_video=allow_video
-            ):
-                if len(hashes) >= max_parts:
+            media_list, texts = _walk_forward_parts(payload, allow_video=allow_video)
+            for media_type, inner_url in media_list:
+                if len(parts) >= max_parts:
                     break
                 if media_type == "video":
-                    digest = await _video_hash(
-                        inner_url, timeout=timeout, ffmpeg_path=ffmpeg_path
+                    add(
+                        await _video_hash(
+                            inner_url, timeout=timeout, ffmpeg_path=ffmpeg_path
+                        )
                     )
                 else:
-                    digest = await _hash_url(inner_url, max_bytes, timeout)
-                if digest:
-                    hashes.append(digest)
-    return hashes
+                    add(await _hash_url(inner_url, max_bytes, timeout))
+            for text in texts:
+                if text.strip() and not _is_placeholder_text(text):
+                    add(_text_part(text))
+    return parts
 
 
 async def compute_media_content_id(
@@ -358,7 +414,7 @@ async def compute_media_content_id(
     if not segments:
         return None
     try:
-        hashes = await _media_hashes_in_segments(
+        parts = await _content_parts_in_segments(
             bot,
             segments,
             max_bytes=max_bytes,
@@ -369,4 +425,4 @@ async def compute_media_content_id(
         )
     except Exception:
         return None
-    return combine_hashes(hashes)
+    return combine_hashes(parts)

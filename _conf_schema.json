@@ -45,22 +45,17 @@
     "default": 50,
     "description": "历史回填时拉取的最大消息条数"
   },
-  "tag_dedupe_seconds": {
+  "tag_dedupe_max_records": {
     "type": "int",
-    "default": 3600,
-    "description": "按目标群去重的消息指纹窗口 (秒)",
-    "hint": "只看某个目标群最近是否已经收到过特征相同的史; 别的群是否收到过不影响该群"
+    "default": 500,
+    "description": "每个目标群保留的最近已搬记录条数 (按条数去重, 不按时间过期)",
+    "hint": "向上找该目标群最近 N 条记录, 只要特征相同就跳过; 0 表示关闭去重; 默认 500, 上限 5000"
   },
   "tag_content_dedupe": {
     "type": "bool",
     "default": true,
     "description": "是否开启媒体内容哈希去重(按目标群判断)",
-    "hint": "开启后会下载图片字节算 SHA-256, 同一张图换消息 ID/套转发卡片再出现时也会跳过; 只跳过已收到过该内容的目标群, 下载失败或无媒体时自动退回消息指纹去重"
-  },
-  "tag_content_dedupe_seconds": {
-    "type": "int",
-    "default": 3600,
-    "description": "按目标群的内容哈希去重窗口 (秒)"
+    "hint": "开启后会下载图片字节算 SHA-256, 同一张图换消息 ID/套转发卡片再出现时也会跳过; 聊天记录按里面的图片/视频/文字内容算, 不会只哈希 [聊天记录] 占位文本; 只跳过已收到过该内容的目标群, 下载失败或无媒体时自动退回消息指纹去重"
   },
   "tag_content_dedupe_max_bytes": {
     "type": "int",
